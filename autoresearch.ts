@@ -1533,17 +1533,41 @@ export default function (amp: PluginAPI) {
 		},
 		async (ctx) => {
 			try {
-				if (!ctx.thread) {
-					await ctx.ui.notify('Autoresearch: open a thread first, then run this command.')
-					return
+				let thread = ctx.thread
+				if (!thread) {
+					// Bootstrap a thread so start works from the welcome screen
+					// (documented host path: getBuiltinAgent(...).createThread).
+					const make = await ctx.ui
+						.confirm({
+							title: 'No active thread',
+							message: 'Create a new thread (deep mode) and start autoresearch in it?',
+						})
+						.catch(() => false)
+					if (!make) {
+						await ctx.ui.notify(
+							'Autoresearch: send any message to create a thread, then re-run this command.',
+						)
+						return
+					}
+					try {
+						thread = await amp.getBuiltinAgent('deep').createThread({ show: true })
+					} catch (e) {
+						amp.logger.log(`autoresearch-start: createThread failed: ${e}`)
+						await ctx.ui.notify(
+							'Autoresearch: could not create a thread. Send any message to create one, then re-run this command.',
+						)
+						return
+					}
 				}
-				// process.cwd() is the plugin host's cwd (not the workspace), so it
-				// makes a misleading default; prefer the thread's bound session.
-				const bound = sessionForThread(ctx.thread.id)
+				// Prefill priority: this thread's bound session, then the host's
+				// workspace root (process.cwd() is the plugin host's dir — misleading).
+				const bound = sessionForThread(thread.id)
+				const wsRoot = ctx.system.workspaceRoot
+				const wsPath = wsRoot ? amp.helpers.filePathFromURI(wsRoot) : ''
 				const workdirInput = await ctx.ui.input({
 					title: 'Autoresearch working directory',
 					helpText: 'Absolute path to the git repository to experiment in.',
-					initialValue: bound?.workdir ?? '',
+					initialValue: bound?.workdir ?? wsPath,
 				})
 				if (!workdirInput) return
 				const workdir = path.resolve(workdirInput.trim())
@@ -1552,7 +1576,7 @@ export default function (amp: PluginAPI) {
 					return
 				}
 				const other = readSessionFile(workdir)
-				if (other?.active && other.threadID !== ctx.thread.id) {
+				if (other?.active && other.threadID !== thread.id) {
 					await ctx.ui.notify(
 						`Autoresearch: session in ${workdir} is held by thread ${other.threadID}. Stop it there first (or init_experiment here to take over).`,
 					)
@@ -1571,7 +1595,7 @@ export default function (amp: PluginAPI) {
 					kickoff = buildCreateKickoff(goal.trim(), workdir)
 				}
 				try {
-					await ctx.thread.appendUserMessage({ type: 'user-message', content: kickoff })
+					await thread.appendUserMessage({ type: 'user-message', content: kickoff })
 					await ctx.ui.notify(
 						hasPrompt
 							? 'Autoresearch: resume kickoff sent — the loop continues from .auto/prompt.md.'

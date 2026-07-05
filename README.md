@@ -1,4 +1,4 @@
-# amp-autoresearch
+# 🔬amp-autoresearch
 
 An [Amp](https://ampcode.com) plugin that turns the agent into an autonomous
 optimization loop: edit code, run the benchmark, log the result, keep what improves,

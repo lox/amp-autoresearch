@@ -316,7 +316,7 @@ declare module '@ampcode/plugin' {
 		 * subagent/tool. When omitted, the thread is created without a parent.
 		 */
 		parentThreadID?: ThreadID
-		/** Show the created thread in the client when supported. */
+		/** Show the created thread and make it active in the client when supported. */
 		show?: boolean
 	}
 
@@ -675,6 +675,16 @@ declare module '@ampcode/plugin' {
 		 * On the CLI, it also shows a dialog with the URL text (for SSH users who can't open URLs remotely).
 		 */
 		open(url: string | URL): Promise<void>
+
+		/**
+		 * Root of the workspace or repository the user has open, or null when Amp is
+		 * running without a workspace. This is stable for the plugin process lifetime;
+		 * plugins are reloaded when the workspace changes.
+		 *
+		 * Use {@link PluginAPI.helpers.filePathFromURI} to convert this file URI to a
+		 * local filesystem path before running workspace-relative shell commands.
+		 */
+		readonly workspaceRoot: URI | null
 
 		/**
 		 * Get the effective Amp base URL currently used by this Amp client.
@@ -1334,7 +1344,12 @@ declare module '@ampcode/plugin' {
 		/** Bun's shell API for executing commands */
 		$: ShellFunction
 
-		/** Current thread context if a thread is active, undefined otherwise */
+		/**
+		 * Current thread context if a thread is active, or `undefined` when the
+		 * user has not started one yet. To create a thread from a command, use
+		 * `amp.getBuiltinAgent(...)` or `amp.createAgent(...)` and call
+		 * `agent.createThread({ show: true })`, then append to the returned thread.
+		 */
 		thread?: PluginThread
 	}
 

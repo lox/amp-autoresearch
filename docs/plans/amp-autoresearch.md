@@ -33,6 +33,14 @@
 - Remaining: cancel-mid-loop bounce-back check in the TUI (the `status !== 'done'`
   gate is unit-tested; synthetic ESC via tmux send-keys did not reach Amp's
   interrupt handling).
+- **Host fixes (2026-07-05)**: after we reported the gaps, Amp added
+  `system.workspaceRoot: URI | null` to the public plugin API and documented
+  `getBuiltinAgent(...).createThread({ show: true })` as the thread-bootstrap path.
+  The Start command now prefills the workdir dialog from the workspace root (bound
+  session still wins) and offers to create a deep-mode thread from the welcome
+  screen instead of no-oping. The `working_dir` tool parameter stays: tool contexts
+  don't carry the workspace root, and cross-process correctness still needs the
+  explicit, validated path.
 
 ## Summary
 
