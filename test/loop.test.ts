@@ -121,3 +121,17 @@ test('resume message round-trips the structural detector after reload', () => {
 	const msg = composeResumeMessage('digest')
 	expect(msg.startsWith('Run the next iteration now.')).toBe(true)
 })
+
+test('kickoff prompts embed workdir, tool contract, and loop rules', async () => {
+	const { buildCreateKickoff, buildResumeKickoff } = await import('../autoresearch')
+	const create = buildCreateKickoff('make parsing faster', '/repo')
+	expect(create).toContain('make parsing faster')
+	expect(create).toContain('working_dir set to the workspace root (/repo)')
+	expect(create).toContain('.auto/measure.sh')
+	expect(create).toContain('NEVER STOP')
+	expect(create).toContain('.auto/amp-session.json')
+	const resume = buildResumeKickoff('/repo')
+	expect(resume).toContain('Resume the autoresearch experiment loop in /repo')
+	expect(resume).toContain('working_dir=/repo')
+	expect(resume).toContain('NEVER STOP')
+})

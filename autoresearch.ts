@@ -757,6 +757,61 @@ export function buildSessionSnapshot(state: SessionState): Record<string, unknow
 	}
 }
 
+// ── Kickoff prompts (port of pi's autoresearch-create skill) ──
+
+const LOOP_RULES = `## Loop Rules
+
+**LOOP FOREVER.** Never ask "should I continue?" — the user expects autonomous work.
+
+- **Primary metric is king.** Improved → \`keep\`. Worse/equal → \`discard\`. Secondary metrics rarely affect this.
+- **Annotate every run with \`asi\`.** Record what you learned — not what you did. Annotate failures and crashes heavily: reverted changes leave no other trace, and unrecorded dead ends get re-discovered.
+- **Watch the confidence score.** After 3+ runs, log_experiment reports the best improvement as a multiple of the session noise floor. ≥2.0× is likely real; <1.0× is within noise — consider re-running before keeping. Advisory only.
+- **Simpler is better.** Removing code for equal perf = keep. Ugly complexity for tiny gain = probably discard.
+- **Don't thrash.** Repeatedly reverting the same idea? Try something structurally different.
+- **Crashes:** fix if trivial, otherwise log and move on.
+- **Think longer when stuck.** Re-read source, study the measurement output, reason about what the machine is actually doing.
+- **Ideas backlog:** append promising-but-deferred optimizations as bullets to \`.auto/ideas.md\`; prune stale entries on resume.
+- Be careful not to overfit to the benchmark and do not cheat on the benchmark.
+
+**NEVER STOP.** The user may be away for hours. Keep going until interrupted.`
+
+/** Kickoff message for a brand-new session (no .auto/prompt.md yet). */
+export function buildCreateKickoff(goal: string, workdir: string): string {
+	return `Set up and run an autonomous experiment loop (autoresearch).
+
+**Goal:** ${goal}
+**Working directory:** ${workdir}
+
+## Setup
+
+1. Infer (or ask once, briefly): the benchmark command, the primary metric (+ direction), files in scope, and constraints.
+2. \`git checkout -b autoresearch/<goal-slug>-<date>\`
+3. Read the source files. Understand the workload deeply before writing anything.
+4. \`mkdir -p .auto\`, then write:
+   - \`.auto/prompt.md\` — the session playbook (objective, metrics, how to run, files in scope, off limits, constraints, "what's been tried"). A fresh agent with no context must be able to run the loop from this file alone. Invest in it.
+   - \`.auto/measure.sh\` — bash, \`set -euo pipefail\`, runs the benchmark and prints \`METRIC name=value\` lines (primary metric name must match init_experiment's metric_name). For fast noisy benchmarks (<5s), run several times inside the script and report the median.
+   - Add \`.auto/log.jsonl\` and \`.auto/amp-session.json\` to .gitignore.
+   - Only if constraints require correctness validation, write \`.auto/checks.sh\` (runs after every passing benchmark; keep output minimal — errors only).
+   Commit these files.
+5. Call \`init_experiment\` with working_dir set to the workspace root (${workdir}), plus name, metric_name, metric_unit, direction.
+6. Run the baseline: \`run_experiment\` (it always executes \`.auto/measure.sh\`), then \`log_experiment\` with status keep.
+7. Loop: edit code → run_experiment → log_experiment (keep improves, discard regresses — reverts are automatic; never commit or revert manually).
+
+${LOOP_RULES}`
+}
+
+/** Kickoff message for resuming an existing session (.auto/prompt.md present). */
+export function buildResumeKickoff(workdir: string): string {
+	return `Resume the autoresearch experiment loop in ${workdir}.
+
+1. Read \`.auto/prompt.md\` and the recent entries of \`.auto/log.jsonl\`, plus \`git log --oneline -20\`.
+2. Call \`init_experiment\` with working_dir=${workdir} and the same name/metric as the existing session (this rebinds without starting a new segment).
+3. Check \`.auto/ideas.md\` for promising paths; prune stale entries.
+4. Continue: edit code → run_experiment → log_experiment. Reverts and commits are automatic.
+
+${LOOP_RULES}`
+}
+
 // ── Loop decisions ──
 
 export interface ContinueDecision {
@@ -1307,6 +1362,139 @@ export default function (amp: PluginAPI) {
 				return
 		}
 	}
+
+	// ── Commands ──
+
+	amp.registerCommand(
+		'autoresearch-start',
+		{
+			title: 'Start',
+			category: 'Autoresearch',
+			description: 'Start (or resume) an autonomous experiment loop in the current thread',
+		},
+		async (ctx) => {
+			try {
+				if (!ctx.thread) {
+					await ctx.ui.notify('Autoresearch: open a thread first, then run this command.')
+					return
+				}
+				const workdirInput = await ctx.ui.input({
+					title: 'Autoresearch working directory',
+					helpText: 'Absolute path to the git repository to experiment in.',
+					initialValue: process.cwd(),
+				})
+				if (!workdirInput) return
+				const workdir = path.resolve(workdirInput.trim())
+				if (!fs.existsSync(workdir) || !fs.statSync(workdir).isDirectory()) {
+					await ctx.ui.notify(`Autoresearch: ${workdir} is not a directory.`)
+					return
+				}
+				const other = readSessionFile(workdir)
+				if (other?.active && other.threadID !== ctx.thread.id) {
+					await ctx.ui.notify(
+						`Autoresearch: session in ${workdir} is held by thread ${other.threadID}. Stop it there first (or init_experiment here to take over).`,
+					)
+					return
+				}
+				const hasPrompt = fs.existsSync(promptPath(workdir))
+				let kickoff: string
+				if (hasPrompt) {
+					kickoff = buildResumeKickoff(workdir)
+				} else {
+					const goal = await ctx.ui.input({
+						title: 'What should autoresearch optimize?',
+						helpText: 'One sentence, e.g. "make the JSON parser benchmark faster".',
+					})
+					if (!goal) return
+					kickoff = buildCreateKickoff(goal.trim(), workdir)
+				}
+				try {
+					await ctx.thread.appendUserMessage({ type: 'user-message', content: kickoff })
+					await ctx.ui.notify(
+						hasPrompt
+							? 'Autoresearch: resume kickoff sent — the loop continues from .auto/prompt.md.'
+							: 'Autoresearch: kickoff sent — the agent will set up .auto/ and start looping.',
+					)
+				} catch {
+					// Spike finding: appendUserMessage needs an active thread; fall back to manual paste.
+					await ctx.ui.notify(
+						'Autoresearch: could not append to this thread. Paste this to start:\n\n' + kickoff,
+					)
+				}
+			} catch (e) {
+				amp.logger.log(`autoresearch-start failed: ${e}`)
+			}
+		},
+	)
+
+	amp.registerCommand(
+		'autoresearch-stop',
+		{
+			title: 'Stop',
+			category: 'Autoresearch',
+			description: "Deactivate the current thread's autoresearch session",
+		},
+		async (ctx) => {
+			const found = ctx.thread && sessionForThread(ctx.thread.id)
+			if (!found) {
+				await ctx.ui.notify('Autoresearch: no active session for this thread.')
+				return
+			}
+			deactivateSession(found.workdir)
+			await ctx.ui.notify(`Autoresearch: session in ${found.workdir} stopped.`)
+		},
+	)
+
+	amp.registerCommand(
+		'autoresearch-clear',
+		{
+			title: 'Clear log',
+			category: 'Autoresearch',
+			description: "Delete the current thread's .auto/log.jsonl and deactivate the session",
+		},
+		async (ctx) => {
+			const found = ctx.thread && sessionForThread(ctx.thread.id)
+			if (!found) {
+				await ctx.ui.notify('Autoresearch: no active session for this thread.')
+				return
+			}
+			const ok = await ctx.ui
+				.confirm({
+					title: 'Clear autoresearch log?',
+					message: `Deletes ${logPath(found.workdir)} and deactivates the session. Kept commits stay in git.`,
+				})
+				.catch(() => false)
+			if (!ok) return
+			try {
+				fs.rmSync(logPath(found.workdir), { force: true })
+			} catch (e) {
+				amp.logger.log(`autoresearch-clear failed: ${e}`)
+			}
+			deactivateSession(found.workdir)
+			await ctx.ui.notify('Autoresearch: log cleared, session deactivated.')
+		},
+	)
+
+	amp.registerCommand(
+		'autoresearch-status',
+		{
+			title: 'Status',
+			category: 'Autoresearch',
+			description: 'Show the state of the autoresearch session for the current thread',
+		},
+		async (ctx) => {
+			const found = ctx.thread && sessionForThread(ctx.thread.id)
+			if (!found) {
+				await ctx.ui.notify('Autoresearch: no active session for this thread.')
+				return
+			}
+			const lp = logPath(found.workdir)
+			const state = reconstructJsonlState(fs.existsSync(lp) ? fs.readFileSync(lp, 'utf-8') : '')
+			await ctx.ui.notify(
+				`Autoresearch (${found.workdir}) — resumes used: ${found.session.autoResumeTurns}/${readMaxAutoResumeTurns(found.workdir)}\n${buildDigest(state)}`,
+			)
+		},
+	)
 
 	amp.logger.log('amp-autoresearch loaded')
 }
