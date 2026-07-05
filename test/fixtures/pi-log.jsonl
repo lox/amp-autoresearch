@@ -1,0 +1,7 @@
+{"type":"config","name":"Optimizing parser","metricName":"total_µs","metricUnit":"µs","bestDirection":"lower"}
+{"run":1,"commit":"aaaaaaa","metric":15586,"metrics":{"parse_µs":10000,"alloc_mb":4.5},"status":"keep","description":"baseline","timestamp":1710000000000,"confidence":null,"asi":{"hypothesis":"baseline","next_action_hint":"try cache"}}
+{"run":2,"commit":"bbbbbbb","metric":14000,"metrics":{"parse_µs":9000,"alloc_mb":4.7},"status":"keep","description":"cache parser","timestamp":1710000001000,"confidence":null,"asi":{"hypothesis":"cache parser","next_action_hint":"tighten loop"}}
+{"run":3,"commit":"ccccccc","metric":14500,"metrics":{"parse_µs":9400,"alloc_mb":4.6},"status":"discard","description":"loop tweak regressed","timestamp":1710000002000,"confidence":2.1}
+{"run":4,"commit":"ddddddd","metric":0,"metrics":{},"status":"crash","description":"unsafe parser","timestamp":1710000003000,"confidence":null,"asi":{"rollback_reason":"crashed"}}
+{"run":5,"commit":"eeeeeee","metric":13800,"metrics":{"parse_µs":8800,"alloc_mb":4.8},"status":"keep","description":"fast path","timestamp":1710000004000,"confidence":3.2}
+{"run":6,"commit":"fffffff","metric":13950,"metrics":{"parse_µs":8900,"alloc_mb":4.8},"status":"discard","description":"minor tweak","timestamp":1710000005000,"confidence":2.8,"asi":{"next_action_hint":"inspect lexer"}}
