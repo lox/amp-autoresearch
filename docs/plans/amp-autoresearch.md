@@ -195,10 +195,13 @@ lines / 4KB, full output saved to a temp file. Runs `.auto/hooks/before.sh` prio
 benchmark; hook stdout is appended to the tool result (not sent as a steer message).
 
 **`log_experiment`** — `{commit, metric, status: keep|discard|crash|checks_failed,
-description, metrics?, force?, asi?}`. Order of operations (fixes a latent pi ordering
-bug): append the JSONL line **first**, then on `keep` run `git add -A && git commit`
-(commit message includes the result trailer); on non-keep, revert with pi's exact
-exclusion globs:
+description, metrics?, force?, asi?}`. Order of operations: on `keep` run
+`git add -A && git commit` first (commit message includes the result trailer), then
+append the JSONL line carrying the **post-commit sha** — finalize-style workflows map
+kept changes by that hash, so accuracy wins over including the log line in its own
+commit. pi's stale-log-in-commit problem is solved instead by the kickoff prompt
+gitignoring `.auto/log.jsonl` and `.auto/amp-session.json` (while `prompt.md` and
+`measure.sh` stay committed). On non-keep, revert with pi's exact exclusion globs:
 
 ```bash
 git checkout -- . ':(exclude,glob)**/.auto' ':(exclude,glob)**/.auto/**'
@@ -546,7 +549,10 @@ latency for in-flight benchmarks); final oracle code review.
 - Gate auto-resume on successful `log_experiment` in the turn, `status === 'done'`, and
   the resume cap (default 20, `maxAutoResumeTurns` override); cap resets on
   user-originated turns detected structurally.
-- jsonl written before git commit (deliberate divergence from pi).
+- Keep commits happen before the jsonl append so keep rows carry the accurate
+  post-commit sha (pi's order); the stale-log-in-commit hazard is closed by
+  gitignoring `.auto/log.jsonl` + `.auto/amp-session.json` in the kickoff instead.
+  (Reverses an earlier decision that traded sha accuracy for commit completeness.)
 - `run_experiment` executes only `.auto/measure.sh` — no arbitrary command parameter
   (deliberate hardening over pi).
 - No dirty-worktree override at init: hard refusal, "commit or stash first". Confirm

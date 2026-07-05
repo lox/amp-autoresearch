@@ -1,6 +1,11 @@
 import * as fs from 'node:fs'
+import { execFile, spawn } from 'node:child_process'
+import * as os from 'node:os'
 import * as path from 'node:path'
+import { promisify } from 'node:util'
 import type { PluginAPI } from '@ampcode/plugin'
+
+const execFileAsync = promisify(execFile)
 
 export type RunStatus = 'keep' | 'discard' | 'crash' | 'checks_failed'
 export type BestDirection = 'lower' | 'higher'
@@ -432,6 +437,680 @@ export function writeSessionFile(workdir: string, session: AmpSession): void {
 	fs.renameSync(tmp, dest)
 }
 
+// ── Runtime/session bindings ──
+
+interface ThreadRuntime {
+	workdir: string
+	lastRunChecks: { pass: boolean; output: string; duration: number } | null
+	lastRunMetrics: Record<string, number> | null
+}
+
+const runtimes = new Map<string, ThreadRuntime>()
+const inflight = new Map<string, { startedAt: number }>()
+
+export function resetRuntimesForTest(): void {
+	runtimes.clear()
+	inflight.clear()
+}
+export function bindThreadSession(threadID: string, workdir: string): void {
+	runtimes.set(threadID, { workdir, lastRunChecks: null, lastRunMetrics: null })
+}
+export function boundWorkdirForThread(threadID: string): string | null {
+	return runtimes.get(threadID)?.workdir ?? null
+}
+function runtimeForThread(threadID: string): ThreadRuntime | null {
+	return runtimes.get(threadID) ?? null
+}
+
+// ── Git helpers ──
+
+async function git(
+	args: string[],
+	cwd: string,
+	timeout = 10_000,
+): Promise<{ stdout: string; stderr: string }> {
+	const r = await execFileAsync('git', args, { cwd, timeout, maxBuffer: 1024 * 1024 })
+	return { stdout: String(r.stdout), stderr: String(r.stderr) }
+}
+export async function gitToplevel(dir: string): Promise<string | null> {
+	try {
+		return (await git(['rev-parse', '--show-toplevel'], dir)).stdout.trim() || null
+	} catch {
+		return null
+	}
+}
+export async function gitIsDirty(dir: string): Promise<boolean> {
+	try {
+		return (await git(['status', '--porcelain'], dir)).stdout.trim().length > 0
+	} catch {
+		return false
+	}
+}
+export async function gitCurrentBranch(dir: string): Promise<string | null> {
+	try {
+		return (await git(['rev-parse', '--abbrev-ref', 'HEAD'], dir)).stdout.trim() || null
+	} catch {
+		return null
+	}
+}
+export async function gitDefaultBranch(dir: string): Promise<string | null> {
+	try {
+		const ref = (await git(['symbolic-ref', 'refs/remotes/origin/HEAD'], dir)).stdout.trim()
+		if (ref) return ref.replace(/^refs\/remotes\/origin\//, '')
+	} catch {}
+	try {
+		const branches = (await git(['branch', '--list', 'main', 'master'], dir)).stdout
+		if (/\bmain\b/.test(branches)) return 'main'
+		if (/\bmaster\b/.test(branches)) return 'master'
+	} catch {}
+	return null
+}
+export async function gitShortHead(dir: string): Promise<string | null> {
+	try {
+		return (await git(['rev-parse', '--short=7', 'HEAD'], dir)).stdout.trim() || null
+	} catch {
+		return null
+	}
+}
+export async function gitCommitAll(
+	dir: string,
+	message: string,
+): Promise<{ ok: true; sha: string } | { ok: false; error: string }> {
+	try {
+		await git(['add', '-A'], dir)
+		try {
+			await git(['diff', '--cached', '--quiet'], dir)
+			return { ok: false, error: 'nothing to commit' }
+		} catch {}
+		await git(['commit', '-m', message], dir)
+		const sha = await gitShortHead(dir)
+		return sha ? { ok: true, sha } : { ok: false, error: 'commit succeeded but HEAD not found' }
+	} catch (e) {
+		return { ok: false, error: e instanceof Error ? e.message : String(e) }
+	}
+}
+export async function gitRevertAll(dir: string): Promise<void> {
+	await execFileAsync(
+		'bash',
+		[
+			'-c',
+			"git checkout -- . ':(exclude,glob)**/.auto' ':(exclude,glob)**/.auto/**'\ngit clean -fd -e '.auto' -e '**/.auto/**' 2>/dev/null",
+		],
+		{ cwd: dir, timeout: 10_000 },
+	)
+}
+
+// ── Hooks/truncation helpers ──
+
+export interface HookResult {
+	fired: boolean
+	exitCode: number | null
+	stdout: string
+	stderr: string
+	timedOut: boolean
+	durationMs: number
+}
+function isExecutableFile(file: string): boolean {
+	try {
+		fs.accessSync(file, fs.constants.X_OK)
+		return fs.statSync(file).isFile()
+	} catch {
+		return false
+	}
+}
+export async function runHook(
+	payload: Record<string, unknown> & { event: 'before' | 'after'; cwd: string },
+): Promise<HookResult> {
+	const script = hookPath(payload.cwd, payload.event)
+	if (!isExecutableFile(script))
+		return { fired: false, exitCode: null, stdout: '', stderr: '', timedOut: false, durationMs: 0 }
+	const t0 = Date.now()
+	return await new Promise((resolve) => {
+		const child = spawn('bash', [script], { cwd: payload.cwd, stdio: ['pipe', 'pipe', 'pipe'] })
+		let stdout = Buffer.alloc(0),
+			stderr = '',
+			timedOut = false
+		const timer = setTimeout(() => {
+			timedOut = true
+			killTree(child.pid)
+		}, 30_000)
+		child.stdout.on('data', (b: Buffer) => {
+			if (stdout.length < 8192) stdout = Buffer.concat([stdout, b]).subarray(0, 8192)
+		})
+		child.stderr.on('data', (b: Buffer) => {
+			stderr += b.toString('utf8')
+		})
+		child.on('close', (code) => {
+			clearTimeout(timer)
+			resolve({
+				fired: true,
+				exitCode: code,
+				stdout: stdout.toString('utf8'),
+				stderr,
+				timedOut,
+				durationMs: Date.now() - t0,
+			})
+		})
+		child.on('error', (e) => {
+			clearTimeout(timer)
+			resolve({
+				fired: true,
+				exitCode: null,
+				stdout: stdout.toString('utf8'),
+				stderr: stderr + e.message,
+				timedOut,
+				durationMs: Date.now() - t0,
+			})
+		})
+		child.stdin.end(JSON.stringify(payload))
+	})
+}
+export function hookResultText(stage: 'before' | 'after', result: HookResult): string | null {
+	if (!result.fired) return null
+	if (result.timedOut) return `[${stage} hook timed out after 30s]`
+	if (result.exitCode !== 0)
+		return [`[${stage} hook exited ${result.exitCode}]`, result.stderr.trim(), result.stdout.trim()]
+			.filter(Boolean)
+			.join('\n')
+	return result.stdout.trim() || null
+}
+function appendHookLogEntryIfConfigured(
+	workdir: string,
+	stage: 'before' | 'after',
+	result: HookResult,
+): void {
+	if (!result.fired) return
+	try {
+		const lp = logPath(workdir)
+		if (!fs.existsSync(lp) || !hasConfigHeader(fs.readFileSync(lp, 'utf-8'))) return
+		fs.appendFileSync(
+			lp,
+			JSON.stringify({
+				type: 'hook',
+				stage,
+				exit_code: result.exitCode,
+				duration_ms: result.durationMs,
+				stdout_bytes: Buffer.byteLength(result.stdout),
+				timed_out: result.timedOut,
+			}) + '\n',
+		)
+	} catch {}
+}
+export function truncateExperimentOutput(
+	output: string,
+	maxLines = 10,
+	maxBytes = 4096,
+): { content: string; truncated: boolean } {
+	let lines = output.split('\n')
+	let truncated = false
+	if (lines.length > maxLines) {
+		lines = lines.slice(-maxLines)
+		truncated = true
+	}
+	let content = lines.join('\n')
+	const b = Buffer.from(content)
+	if (b.length > maxBytes) {
+		content = b.subarray(b.length - maxBytes).toString('utf8')
+		truncated = true
+	}
+	return { content, truncated }
+}
+function killTree(pid: number | undefined): void {
+	if (!pid) return
+	try {
+		process.kill(-pid, 'SIGTERM')
+	} catch {
+		try {
+			process.kill(pid, 'SIGTERM')
+		} catch {}
+	}
+	setTimeout(() => {
+		try {
+			process.kill(-pid, 'SIGKILL')
+		} catch {
+			try {
+				process.kill(pid, 'SIGKILL')
+			} catch {}
+		}
+	}, 1000).unref?.()
+}
+export function checkSecondaryMetrics(
+	established: string[],
+	provided: Record<string, number> | undefined,
+	force = false,
+): { ok: true } | { error: string } {
+	const p = new Set(Object.keys(provided ?? {}))
+	const missing = established.filter((n) => !p.has(n))
+	if (missing.length) return { error: `Missing secondary metrics: ${missing.join(', ')}` }
+	const news = [...p].filter((n) => !established.includes(n))
+	if (news.length && !force)
+		return {
+			error: `New secondary metric${news.length > 1 ? 's' : ''} not previously tracked: ${news.join(', ')}. Use force:true only if valuable.`,
+		}
+	return { ok: true }
+}
+export function buildSessionSnapshot(state: SessionState): Record<string, unknown> {
+	const runs = currentResults(state.results, state.currentSegment)
+	return {
+		metric_name: state.metricName,
+		metric_unit: state.metricUnit,
+		direction: state.bestDirection,
+		baseline_metric: findBaselineMetric(state.results, state.currentSegment),
+		best_metric: bestMetric(runs, state.bestDirection),
+		run_count: runs.length,
+		goal: state.name ?? '',
+	}
+}
+
+// ── Tool execute functions ──
+
+type ToolCtx = {
+	ui?: { confirm?: (o: { title: string; message?: string }) => Promise<boolean> }
+	thread: { id: string; state?: { get?: () => Promise<string> } }
+}
+const unbound =
+	'No experiment session for this thread. Call init_experiment with the workspace root first.'
+/** Coerce agent-supplied seconds to a positive finite number, else the default. */
+function positiveSeconds(value: unknown, fallback: number): number {
+	const n = Number(value)
+	return Number.isFinite(n) && n > 0 ? n : fallback
+}
+async function confirm(ui: ToolCtx['ui'], title: string, message: string): Promise<boolean> {
+	try {
+		return !!(await ui?.confirm?.({ title, message }))
+	} catch {
+		return false
+	}
+}
+function readState(workdir: string): SessionState {
+	return reconstructJsonlState(
+		fs.existsSync(logPath(workdir)) ? fs.readFileSync(logPath(workdir), 'utf-8') : '',
+	)
+}
+
+export async function executeInit(input: Record<string, unknown>, ctx: ToolCtx): Promise<string> {
+	try {
+		const wd = String(input.working_dir ?? ''),
+			name = String(input.name ?? ''),
+			metricName = String(input.metric_name ?? '')
+		const metricUnit = typeof input.metric_unit === 'string' ? input.metric_unit : ''
+		const bestDirection: BestDirection = input.direction === 'higher' ? 'higher' : 'lower'
+		if (!path.isAbsolute(wd) || !fs.existsSync(wd) || !fs.statSync(wd).isDirectory())
+			return '❌ working_dir must be an existing absolute directory'
+		const top = await gitToplevel(fs.realpathSync(wd))
+		if (!top) return '❌ working_dir must be inside a git repository'
+		const workdir = fs.realpathSync(resolveWorkDir(top))
+		const existing = readSessionFile(workdir),
+			same = existing?.active && existing.threadID === ctx.thread.id,
+			takeover = existing?.active && existing.threadID !== ctx.thread.id
+		if (takeover) {
+			// One dialog covers both takeover and workdir identity.
+			if (
+				!(await confirm(
+					ctx.ui,
+					'Take over autoresearch session?',
+					`.auto/amp-session.json in ${workdir} is held by thread ${existing!.threadID}. Take over?`,
+				))
+			)
+				return `❌ Autoresearch session is held by thread ${existing!.threadID}.`
+		} else if (
+			!same &&
+			!(await confirm(
+				ctx.ui,
+				'Start autoresearch session?',
+				`Start autoresearch session in ${workdir}?`,
+			))
+		)
+			return '❌ Refusing to start autoresearch session without user confirmation.'
+		const oldText = fs.existsSync(logPath(workdir))
+			? fs.readFileSync(logPath(workdir), 'utf-8')
+			: ''
+		const state = reconstructJsonlState(oldText)
+		const sameConfig =
+			state.name === name &&
+			state.metricName === metricName &&
+			state.metricUnit === metricUnit &&
+			state.bestDirection === bestDirection
+		if (!(same && sameConfig)) {
+			if (await gitIsDirty(workdir))
+				return '❌ Working tree is dirty — commit or stash first. Autoresearch auto-reverts will destroy uncommitted changes.'
+			const cur = await gitCurrentBranch(workdir),
+				def = await gitDefaultBranch(workdir)
+			if (
+				cur &&
+				def &&
+				cur === def &&
+				!(await confirm(
+					ctx.ui,
+					'Run autoresearch on default branch?',
+					`Current branch is ${cur}. Consider: git checkout -b autoresearch/${name.replace(/\W+/g, '-')}-${new Date().toISOString().slice(0, 10)}`,
+				))
+			)
+				return `❌ Refusing to run on default branch. Try git checkout -b autoresearch/${name.replace(/\W+/g, '-')}-${new Date().toISOString().slice(0, 10)}`
+		}
+		fs.mkdirSync(autoDir(workdir), { recursive: true })
+		let resumed = sameConfig && state.results.length > 0
+		if (!sameConfig)
+			fs.appendFileSync(
+				logPath(workdir),
+				JSON.stringify({ type: 'config', name, metricName, metricUnit, bestDirection }) + '\n',
+			)
+		writeSessionFile(workdir, {
+			version: 1,
+			threadID: ctx.thread.id,
+			workdir,
+			active: true,
+			autoResumeTurns: existing?.autoResumeTurns ?? 0,
+			activatedAt: Date.now(),
+		})
+		bindThreadSession(ctx.thread.id, workdir)
+		const rt = runtimeForThread(ctx.thread.id)!
+		rt.lastRunChecks = null
+		rt.lastRunMetrics = null
+		let hookText = ''
+		if (!same) {
+			const h = await runHook({
+				event: 'before',
+				cwd: workdir,
+				next_run: state.results.length + 1,
+				last_run: null,
+				session: buildSessionSnapshot(state),
+			})
+			appendHookLogEntryIfConfigured(workdir, 'before', h)
+			hookText = hookResultText('before', h) ?? ''
+		}
+		const cap = readMaxExperiments(workdir)
+		return [
+			`✅ Experiment ${resumed ? 'resumed' : 'initialized'}: "${name}"`,
+			`Metric: ${metricName} (${metricUnit || 'unitless'}, ${bestDirection} is better)`,
+			`Workdir: ${workdir}`,
+			`Runs so far: ${state.results.length}`,
+			cap ? `Max iterations: ${cap}` : '',
+			'Next: Run the baseline: run_experiment()',
+			hookText,
+		]
+			.filter(Boolean)
+			.join('\n')
+	} catch (e) {
+		return `❌ init_experiment failed: ${e instanceof Error ? e.message : String(e)}`
+	}
+}
+
+export async function executeRun(input: Record<string, unknown>, ctx: ToolCtx): Promise<string> {
+	const rt = runtimeForThread(ctx.thread.id)
+	if (!rt) return unbound
+	const workdir = rt.workdir
+	if (!fs.existsSync(measurePath(workdir)))
+		return '❌ Missing .auto/measure.sh. Write a benchmark script that emits METRIC name=value lines and commit it first.'
+	const state = readState(workdir),
+		cap = readMaxExperiments(workdir),
+		segCount = currentResults(state.results, state.currentSegment).length
+	if (cap !== null && segCount >= cap) return `🛑 Maximum experiments reached (${cap}). Stop.`
+	const running = inflight.get(workdir)
+	if (running)
+		return `❌ Experiment already running, started ${Math.floor((Date.now() - running.startedAt) / 1000)}s ago.`
+	inflight.set(workdir, { startedAt: Date.now() })
+	try {
+		const h = await runHook({
+			event: 'before',
+			cwd: workdir,
+			next_run: state.results.length + 1,
+			last_run: state.results.at(-1) ?? null,
+			session: buildSessionSnapshot(state),
+		})
+		appendHookLogEntryIfConfigured(workdir, 'before', h)
+		const timeout = positiveSeconds(input.timeout_seconds, 600) * 1000,
+			t0 = Date.now()
+		let out = '',
+			exitCode: number | null = null,
+			timedOut = false,
+			cancelled = false
+		await new Promise<void>((resolve) => {
+			const child = spawn('bash', [measurePath(workdir)], {
+				cwd: workdir,
+				detached: true,
+				stdio: ['ignore', 'pipe', 'pipe'],
+			})
+			const add = (b: Buffer) => {
+				out += b.toString('utf8')
+				if (out.length > 1024 * 1024) out = out.slice(-1024 * 1024)
+			}
+			child.stdout.on('data', add)
+			child.stderr.on('data', add)
+			const timer = setTimeout(() => {
+				timedOut = true
+				killTree(child.pid)
+			}, timeout)
+			const poll = setInterval(async () => {
+				try {
+					if ((await ctx.thread.state?.get?.()) === 'idle') {
+						cancelled = true
+						killTree(child.pid)
+					}
+				} catch {
+					clearInterval(poll)
+				}
+			}, 5000)
+			child.on('close', (c) => {
+				exitCode = c
+				clearTimeout(timer)
+				clearInterval(poll)
+				resolve()
+			})
+			child.on('error', (e) => {
+				out += e.message
+				clearTimeout(timer)
+				clearInterval(poll)
+				resolve()
+			})
+		})
+		const duration = Date.now() - t0,
+			benchmarkPassed = exitCode === 0 && !timedOut && !cancelled
+		if (benchmarkPassed && fs.existsSync(checksPath(workdir))) {
+			const ct0 = Date.now()
+			try {
+				const r = await execFileAsync('bash', [checksPath(workdir)], {
+					cwd: workdir,
+					timeout: positiveSeconds(input.checks_timeout_seconds, 300) * 1000,
+					maxBuffer: 1024 * 1024,
+				})
+				rt.lastRunChecks = {
+					pass: true,
+					output: `${r.stdout}${r.stderr}`.trim().slice(-4096),
+					duration: Date.now() - ct0,
+				}
+			} catch (e) {
+				rt.lastRunChecks = {
+					pass: false,
+					output: e instanceof Error ? e.message.slice(-4096) : String(e).slice(-4096),
+					duration: Date.now() - ct0,
+				}
+			}
+		} else rt.lastRunChecks = null
+		rt.lastRunMetrics = Object.fromEntries(parseMetricLines(out))
+		const trunc = truncateExperimentOutput(out)
+		let temp = ''
+		if (trunc.truncated) {
+			const p = path.join(os.tmpdir(), `amp-experiment-${Math.random().toString(16).slice(2)}.log`)
+			fs.writeFileSync(p, out)
+			temp = `\nFull output: ${p}`
+		}
+		return [
+			`${benchmarkPassed ? '✅ PASSED' : timedOut ? '⏰ TIMEOUT' : cancelled ? '⚠️ CANCELLED' : '❌ FAILED'} exit=${exitCode} in ${formatElapsed(duration)}`,
+			Object.keys(rt.lastRunMetrics).length
+				? `Parsed metrics: ${Object.entries(rt.lastRunMetrics)
+						.map(([k, v]) => `${k}=${v}`)
+						.join(', ')}`
+				: '',
+			rt.lastRunChecks
+				? rt.lastRunChecks.pass
+					? `✅ Checks passed in ${formatElapsed(rt.lastRunChecks.duration)}`
+					: `💥 CHECKS FAILED — log as checks_failed\n${rt.lastRunChecks.output}`
+				: '',
+			hookResultText('before', h) ?? '',
+			trunc.content ? `\n── output tail ──\n${trunc.content}${temp}` : '',
+		]
+			.filter(Boolean)
+			.join('\n')
+	} finally {
+		inflight.delete(workdir)
+	}
+}
+
+export async function executeLog(input: Record<string, unknown>, ctx: ToolCtx): Promise<string> {
+	try {
+		const rt = runtimeForThread(ctx.thread.id)
+		if (!rt) return unbound
+		const workdir = rt.workdir,
+			state = readState(workdir),
+			metrics = isObjectRecord(input.metrics) ? metricMapFrom(input.metrics) : {}
+		if (
+			input.status !== 'keep' &&
+			input.status !== 'discard' &&
+			input.status !== 'crash' &&
+			input.status !== 'checks_failed'
+		)
+			return `❌ Invalid status ${JSON.stringify(input.status)}. Use keep, discard, crash, or checks_failed.`
+		const status: RunStatus = input.status
+		if (!Number.isFinite(Number(input.metric)))
+			return '❌ metric must be a finite number (use 0 for crashes).'
+		if (status === 'keep' && rt.lastRunChecks && !rt.lastRunChecks.pass)
+			return `❌ Cannot keep — .auto/checks.sh failed.\n\n${rt.lastRunChecks.output.slice(-500)}\n\nLog as 'checks_failed' instead.`
+		const chk = checkSecondaryMetrics(
+			state.secondaryMetrics.map((m) => m.name),
+			metrics,
+			input.force === true,
+		)
+		if ('error' in chk) return `❌ ${chk.error}`
+		const beforeBest = bestMetric(
+			currentResults(state.results, state.currentSegment),
+			state.bestDirection,
+		)
+		let entry: Record<string, unknown> = {
+			run: state.results.length + 1,
+			commit: String(input.commit ?? '').slice(0, 7),
+			metric: Number(input.metric),
+			metrics,
+			status,
+			description: String(input.description ?? ''),
+			timestamp: Date.now(),
+			confidence: null,
+		}
+		if (isObjectRecord(input.asi) && Object.keys(input.asi).length) entry.asi = input.asi
+		const tempRun = runFrom(entry as RunEntry, state.currentSegment)
+		state.results.push(tempRun)
+		entry.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection)
+		let gitLine = ''
+		if (status === 'keep') {
+			const gr = await gitCommitAll(
+				workdir,
+				`${entry.description}\n\nResult: ${JSON.stringify({ status, [state.metricName]: entry.metric, ...metrics })}`,
+			)
+			if (gr.ok) {
+				entry.commit = gr.sha
+				gitLine = `📝 Git: committed ${gr.sha}`
+			} else gitLine = `⚠️ Git commit failed: ${gr.error}`
+		}
+		fs.mkdirSync(autoDir(workdir), { recursive: true })
+		fs.appendFileSync(logPath(workdir), JSON.stringify(entry) + '\n')
+		if (status !== 'keep') {
+			await gitRevertAll(workdir)
+			gitLine = `📝 Git: reverted changes (${status}) — .auto/ preserved`
+		}
+		const h = await runHook({
+			event: 'after',
+			cwd: workdir,
+			run_entry: entry,
+			session: buildSessionSnapshot(state),
+		})
+		appendHookLogEntryIfConfigured(workdir, 'after', h)
+		const seg = currentResults(state.results, state.currentSegment),
+			baseline = findBaselineMetric(state.results, state.currentSegment),
+			best = bestMetric(seg, state.bestDirection),
+			counts: Record<RunStatus, number> = { keep: 0, discard: 0, crash: 0, checks_failed: 0 }
+		for (const r of seg) counts[r.status]++
+		const cap = readMaxExperiments(workdir)
+		let limit = ''
+		if (cap !== null && seg.length >= cap) {
+			const s = readSessionFile(workdir)
+			if (s) writeSessionFile(workdir, { ...s, active: false })
+			limit = `\n🛑 Maximum experiments reached (${cap}). STOP the experiment loop now.`
+		}
+		rt.lastRunChecks = null
+		rt.lastRunMetrics = null
+		const conf =
+			typeof entry.confidence === 'number'
+				? `Confidence: ${entry.confidence.toFixed(1)}× noise floor — ${entry.confidence >= 2 ? 'improvement is likely real' : entry.confidence >= 1 ? 'borderline' : 'within noise'}`
+				: 'Confidence: —'
+		return [
+			`${status === 'keep' ? '✅ kept' : status === 'discard' ? '↩️ discarded' : status === 'crash' ? '💥 crashed' : '⚠️ checks_failed'} #${entry.run}: ${entry.description}`,
+			`${state.metricName}: ${formatNum(Number(entry.metric), state.metricUnit)} vs baseline${formatDelta(Number(entry.metric), baseline)} vs best-before${formatDelta(Number(entry.metric), beforeBest)}`,
+			`Tallies: ${counts.keep} keep, ${counts.discard} discard, ${counts.crash} crash, ${counts.checks_failed} checks_failed`,
+			conf,
+			`Best so far: ${formatNum(best, state.metricUnit)}`,
+			'Recent:',
+			...seg.slice(-3).map((r) => `  ${formatRunLine(r, baselineFor(r, state.results))}`),
+			gitLine,
+			hookResultText('after', h) ?? '',
+			limit,
+		]
+			.filter(Boolean)
+			.join('\n')
+	} catch (e) {
+		return `❌ log_experiment failed: ${e instanceof Error ? e.message : String(e)}`
+	}
+}
+
 export default function (amp: PluginAPI) {
-	amp.logger.log('amp-autoresearch loaded (slice 1: core only)')
+	amp.registerTool({
+		name: 'init_experiment',
+		description: 'Initialize an autoresearch experiment session for this thread.',
+		inputSchema: {
+			type: 'object',
+			properties: {
+				working_dir: {
+					type: 'string',
+					description: 'Absolute path to the workspace root (must be a git repository)',
+				},
+				name: { type: 'string' },
+				metric_name: { type: 'string' },
+				metric_unit: { type: 'string' },
+				direction: { type: 'string', enum: ['lower', 'higher'] },
+			},
+			required: ['working_dir', 'name', 'metric_name'],
+		},
+		execute: executeInit,
+	})
+	amp.registerTool({
+		name: 'run_experiment',
+		description: 'Run .auto/measure.sh, parse METRIC lines, and optionally run .auto/checks.sh.',
+		inputSchema: {
+			type: 'object',
+			properties: {
+				timeout_seconds: { type: 'number' },
+				checks_timeout_seconds: { type: 'number' },
+			},
+		},
+		execute: executeRun,
+	})
+	amp.registerTool({
+		name: 'log_experiment',
+		description:
+			'Log an experiment result, commit kept changes, or revert discarded/crashed changes.',
+		inputSchema: {
+			type: 'object',
+			properties: {
+				commit: { type: 'string' },
+				metric: { type: 'number' },
+				status: { type: 'string', enum: ['keep', 'discard', 'crash', 'checks_failed'] },
+				description: { type: 'string' },
+				metrics: { type: 'object', additionalProperties: { type: 'number' } },
+				force: { type: 'boolean' },
+				asi: { type: 'object' },
+			},
+			required: ['commit', 'metric', 'status', 'description'],
+		},
+		execute: executeLog,
+	})
+	amp.logger.log('amp-autoresearch loaded')
 }
