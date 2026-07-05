@@ -788,6 +788,7 @@ const LOOP_RULES = `## Loop Rules
 - **Don't thrash.** Repeatedly reverting the same idea? Try something structurally different.
 - **Crashes:** fix if trivial, otherwise log and move on.
 - **Think longer when stuck.** Re-read source, study the measurement output, reason about what the machine is actually doing.
+- **Stuck for 3+ discards in a row: consult the oracle** (if available) before trying more variations — give it the measurement data, your dead-end notes from \`.auto/log.jsonl\`, and the relevant source files, and ask where the metric is actually being spent.
 - **Ideas backlog:** append promising-but-deferred optimizations as bullets to \`.auto/ideas.md\`; prune stale entries on resume.
 - Be careful not to overfit to the benchmark and do not cheat on the benchmark.
 
