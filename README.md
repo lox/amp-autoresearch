@@ -14,7 +14,7 @@ edit code → run_experiment → log_experiment → keep or revert → repeat
 ## Install
 
 ```sh
-make install    # symlinks autoresearch.ts into ~/.config/amp/plugins/
+mise run install    # symlinks autoresearch.ts into ~/.config/amp/plugins/
 ```
 
 Then restart Amp or run `plugins: reload` from the command palette. The symlink matters:
@@ -123,9 +123,10 @@ do this); commit `prompt.md` and `measure.sh`.
 ## Development
 
 ```sh
-make check      # bun test + tsc --noEmit
-make test
-make typecheck
+mise run check      # bun test + tsc --noEmit
+mise run test
+mise run typecheck
+mise run fmt        # prettier
 ```
 
 Design/plan: [docs/plans/amp-autoresearch.md](docs/plans/amp-autoresearch.md).

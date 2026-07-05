@@ -426,7 +426,7 @@ amp-autoresearch/
 │   ├── jsonl.test.ts        # state reconstruction (pure)
 │   ├── confidence.test.ts   # MAD scoring (pure)
 │   └── fixtures/
-├── Makefile                 # install (symlink), test, lint
+├── mise.toml                # tasks: install (symlink), test, typecheck, check, fmt
 └── README.md
 ```
 
@@ -480,7 +480,7 @@ tool `execute` (needed for orphaned-benchmark reaping).
 
 ### Slice 1 — Scaffold + state core
 
-Repo scaffold, Makefile (symlink install), and the pure core: jsonl
+Repo scaffold, mise tasks (symlink install), and the pure core: jsonl
 parse/reconstruct (port of pi's `jsonl.ts`), confidence scoring, `METRIC` line parser,
 digest renderer, `.auto/` path helpers, `amp-session.json` read/write. Unit tests for
 all of it.
