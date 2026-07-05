@@ -99,7 +99,15 @@
   .tooltip .t-desc { color: var(--muted); margin-top: 3px; }
 
   /* ── Runs table ── */
-  table { width: 100%; border-collapse: collapse; }
+  /* Fixed layout: column widths must not reflow when a detail row
+     (colspan cell with long content) is expanded. */
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  col.c-run { width: 64px; }
+  col.c-status { width: 96px; }
+  col.c-metric { width: 130px; }
+  col.c-delta { width: 82px; }
+  col.c-conf { width: 68px; }
+  col.c-commit { width: 92px; }
   thead th {
     text-align: left; font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase;
     color: var(--muted); font-weight: 500; padding: 8px 10px; border-bottom: 1px solid var(--line);
@@ -111,8 +119,10 @@
   tbody tr.run.best-row { background: rgba(70, 224, 138, 0.05); }
   tbody tr.run.best-row:hover { background: rgba(70, 224, 138, 0.09); }
   td { padding: 8px 10px; vertical-align: baseline; font-variant-numeric: tabular-nums; }
-  td.run-id { color: var(--muted); width: 64px; white-space: nowrap; }
-  td.num, td.commit { white-space: nowrap; }
+  td.run-id { color: var(--muted); white-space: nowrap; }
+  td.num { white-space: nowrap; }
+  td.commit { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  td.desc { overflow-wrap: break-word; }
   .badge {
     display: inline-block; font-size: 10px; letter-spacing: 0.08em; padding: 1px 8px 2px;
     border-radius: 999px; border: 1px solid transparent;
@@ -151,6 +161,8 @@
     body { font-size: 12px; padding-top: 18px; }
     .desc { max-width: none; }
     th.hide-sm, td.hide-sm { display: none; }
+    /* hidden cells misalign fixed-layout column tracks; fall back to auto */
+    table { table-layout: auto; }
   }
 </style>
 </head>
@@ -404,6 +416,10 @@ function renderTable(state, d) {
   })
   wrap.innerHTML = `
     <table>
+      <colgroup>
+        <col class="c-run" /><col class="c-status" /><col class="c-metric" />
+        <col class="c-delta" /><col class="c-conf" /><col class="c-commit" /><col />
+      </colgroup>
       <thead><tr>
         <th>Run</th><th>Status</th><th class="num">${esc(state.metricName)}</th>
         <th class="num">Δ base</th><th class="num hide-sm">Conf</th>
