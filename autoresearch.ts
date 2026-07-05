@@ -454,12 +454,67 @@ export function resetRuntimesForTest(): void {
 }
 export function bindThreadSession(threadID: string, workdir: string): void {
 	runtimes.set(threadID, { workdir, lastRunChecks: null, lastRunMetrics: null })
+	writeBinding(threadID, workdir)
 }
 export function boundWorkdirForThread(threadID: string): string | null {
 	return runtimes.get(threadID)?.workdir ?? null
 }
 function runtimeForThread(threadID: string): ThreadRuntime | null {
 	return runtimes.get(threadID) ?? null
+}
+
+// ── Thread→workdir bindings index ──
+// A derived, disposable cache so event handlers can find a thread's workdir
+// after a plugin reload. `.auto/amp-session.json` in the workdir remains the
+// authoritative record: a bindings entry is only honored when that session
+// file names the same thread.
+
+let bindingsFile = path.join(os.homedir(), '.config', 'amp', 'autoresearch', 'bindings.json')
+/** Override the bindings index location (tests only). */
+export function setBindingsFileForTest(p: string): void {
+	bindingsFile = p
+}
+function readBindings(): Record<string, string> {
+	try {
+		const parsed: unknown = JSON.parse(fs.readFileSync(bindingsFile, 'utf-8'))
+		if (!isObjectRecord(parsed)) return {}
+		const out: Record<string, string> = {}
+		for (const [k, v] of Object.entries(parsed)) if (typeof v === 'string') out[k] = v
+		return out
+	} catch {
+		return {}
+	}
+}
+function writeBinding(threadID: string, workdir: string): void {
+	try {
+		const bindings = readBindings()
+		bindings[threadID] = workdir
+		fs.mkdirSync(path.dirname(bindingsFile), { recursive: true })
+		fs.writeFileSync(bindingsFile, `${JSON.stringify(bindings, null, 2)}\n`)
+	} catch {}
+}
+
+/**
+ * Find the active session for a thread: in-memory binding first, then the
+ * bindings index validated against the workdir's amp-session.json.
+ * Returns null when the thread holds no active session.
+ */
+export function sessionForThread(
+	threadID: string,
+): { workdir: string; session: AmpSession } | null {
+	const candidates: string[] = []
+	const bound = boundWorkdirForThread(threadID)
+	if (bound) candidates.push(bound)
+	const indexed = readBindings()[threadID]
+	if (indexed && indexed !== bound) candidates.push(indexed)
+	for (const workdir of candidates) {
+		const session = readSessionFile(workdir)
+		if (session && session.active && session.threadID === threadID) {
+			if (!boundWorkdirForThread(threadID)) bindThreadSession(threadID, workdir)
+			return { workdir, session }
+		}
+	}
+	return null
 }
 
 // ── Git helpers ──
@@ -702,6 +757,56 @@ export function buildSessionSnapshot(state: SessionState): Record<string, unknow
 	}
 }
 
+// ── Loop decisions ──
+
+export interface ContinueDecision {
+	action: 'continue' | 'stop-cap' | 'stop-stranded' | 'none'
+	userMessage?: string
+	notice?: string
+}
+
+/**
+ * Decide whether to auto-resume after an agent turn.
+ * Gates (all must hold): session active, turn status 'done', a log_experiment
+ * tool call completed this turn, resume cap not reached, and the on-disk log
+ * still exists (fail closed on stranded sessions, e.g. after a branch switch).
+ */
+export function decideContinue(args: {
+	session: AmpSession
+	workdir: string
+	turnStatus: 'done' | 'error' | 'cancelled'
+	turnLoggedExperiment: boolean
+	maxTurns: number
+}): ContinueDecision {
+	const { session, workdir, turnStatus, turnLoggedExperiment, maxTurns } = args
+	if (!session.active || turnStatus !== 'done' || !turnLoggedExperiment) return { action: 'none' }
+	if (!fs.existsSync(logPath(workdir)))
+		return {
+			action: 'stop-stranded',
+			notice: `Autoresearch stopped: ${logPath(workdir)} is missing (branch switch?). Session deactivated.`,
+		}
+	if (session.autoResumeTurns >= maxTurns)
+		return {
+			action: 'stop-cap',
+			notice: `Autoresearch paused: auto-resume cap reached (${maxTurns} turns). Send a message to continue, or raise maxAutoResumeTurns in .auto/config.json.`,
+		}
+	const state = reconstructJsonlState(fs.readFileSync(logPath(workdir), 'utf-8'))
+	return { action: 'continue', userMessage: composeResumeMessage(buildDigest(state)) }
+}
+
+/** True when a completed log_experiment tool call appears in the turn's messages. */
+export function turnLoggedExperiment(
+	toolCalls: Array<{ call: { tool: string }; result: { status: string } }>,
+): boolean {
+	return toolCalls.some((tc) => tc.call.tool === 'log_experiment' && tc.result.status === 'done')
+}
+
+/** Mark a session inactive on disk. */
+export function deactivateSession(workdir: string): void {
+	const s = readSessionFile(workdir)
+	if (s?.active) writeSessionFile(workdir, { ...s, active: false })
+}
+
 // ── Tool execute functions ──
 
 type ToolCtx = {
@@ -716,6 +821,9 @@ function positiveSeconds(value: unknown, fallback: number): number {
 	return Number.isFinite(n) && n > 0 ? n : fallback
 }
 async function confirm(ui: ToolCtx['ui'], title: string, message: string): Promise<boolean> {
+	// Headless escape hatch (execute mode has no UI and confirms fail closed):
+	// only for users who deliberately opt in, e.g. overnight `amp -x` loops.
+	if (process.env.AMP_AUTORESEARCH_ASSUME_YES === '1') return true
 	try {
 		return !!(await ui?.confirm?.({ title, message }))
 	} catch {
@@ -1112,5 +1220,93 @@ export default function (amp: PluginAPI) {
 		},
 		execute: executeLog,
 	})
+
+	const notify = async (ctx: { ui: { notify: (m: string) => Promise<void> } }, message: string) => {
+		try {
+			await ctx.ui.notify(message)
+		} catch {
+			amp.logger.log(message)
+		}
+	}
+
+	amp.on('agent.start', (event) => {
+		try {
+			return agentStart(event)
+		} catch (e) {
+			amp.logger.log(`autoresearch agent.start failed: ${e}`)
+			return {}
+		}
+	})
+
+	const agentStart = (event: { thread: { id: string }; message: string }) => {
+		const found = sessionForThread(event.thread.id)
+		if (!found) return {}
+		const { workdir, session } = found
+		// A genuine user message resets the auto-resume budget.
+		if (!isResumeMessage(event.message) && session.autoResumeTurns !== 0) {
+			try {
+				writeSessionFile(workdir, { ...session, autoResumeTurns: 0 })
+			} catch (e) {
+				amp.logger.log(`autoresearch: failed to reset resume cap: ${e}`)
+			}
+		}
+		// Resume messages already carry the digest; only user-originated turns need it.
+		if (isResumeMessage(event.message)) return {}
+		if (!fs.existsSync(logPath(workdir))) return {}
+		try {
+			const state = reconstructJsonlState(fs.readFileSync(logPath(workdir), 'utf-8'))
+			return {
+				message: {
+					content: `<${STATE_TAG}>\n${buildDigest(state)}\n</${STATE_TAG}>`,
+					display: false,
+				},
+			}
+		} catch {
+			return {}
+		}
+	}
+
+	amp.on('agent.end', async (event, ctx) => {
+		try {
+			return await agentEnd(event, ctx)
+		} catch (e) {
+			amp.logger.log(`autoresearch agent.end failed: ${e}`)
+		}
+	})
+
+	const agentEnd = async (
+		event: {
+			thread: { id: string }
+			status: 'done' | 'error' | 'cancelled'
+			messages: Parameters<typeof amp.helpers.toolCallsInMessages>[0]
+		},
+		ctx: { ui: { notify: (m: string) => Promise<void> } },
+	) => {
+		const found = sessionForThread(event.thread.id)
+		if (!found) return
+		const { workdir, session } = found
+		const decision = decideContinue({
+			session,
+			workdir,
+			turnStatus: event.status,
+			turnLoggedExperiment: turnLoggedExperiment(amp.helpers.toolCallsInMessages(event.messages)),
+			maxTurns: readMaxAutoResumeTurns(workdir),
+		})
+		switch (decision.action) {
+			case 'continue':
+				writeSessionFile(workdir, { ...session, autoResumeTurns: session.autoResumeTurns + 1 })
+				return { action: 'continue' as const, userMessage: decision.userMessage! }
+			case 'stop-stranded':
+				deactivateSession(workdir)
+				await notify(ctx, decision.notice!)
+				return
+			case 'stop-cap':
+				await notify(ctx, decision.notice!)
+				return
+			case 'none':
+				return
+		}
+	}
+
 	amp.logger.log('amp-autoresearch loaded')
 }
