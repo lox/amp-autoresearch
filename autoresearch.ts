@@ -398,14 +398,25 @@ export function inflightPath(workdir: string): string {
 const INFLIGHT_STALE_MS = 30 * 60 * 1000
 /** Read the cross-process in-flight marker; null when absent or stale. */
 export function readInflight(workdir: string): { startedAt: number } | null {
+	const p = inflightPath(workdir)
+	let startedAt: number | null = null
 	try {
-		const parsed: unknown = JSON.parse(fs.readFileSync(inflightPath(workdir), 'utf-8'))
-		if (!isObjectRecord(parsed) || typeof parsed.startedAt !== 'number') return null
-		if (Date.now() - parsed.startedAt > INFLIGHT_STALE_MS) return null
-		return { startedAt: parsed.startedAt }
-	} catch {
-		return null
+		const parsed: unknown = JSON.parse(fs.readFileSync(p, 'utf-8'))
+		if (isObjectRecord(parsed) && typeof parsed.startedAt === 'number') startedAt = parsed.startedAt
+	} catch (e) {
+		if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null
 	}
+	if (startedAt === null) {
+		// The file exists but is torn/corrupt (writes aren't atomic). Fail closed:
+		// treat it as a running experiment, dated by the file's mtime.
+		try {
+			startedAt = fs.statSync(p).mtimeMs
+		} catch {
+			return null
+		}
+	}
+	if (Date.now() - startedAt > INFLIGHT_STALE_MS) return null
+	return { startedAt }
 }
 export function hookPath(workdir: string, hook: 'before' | 'after'): string {
 	return path.join(autoDir(workdir), 'hooks', `${hook}.sh`)
@@ -1052,22 +1063,31 @@ export function buildFinalReviewMessage(state: SessionState, workdir: string): s
 	].join('\n')
 }
 
-/** Decide whether to send the one-shot end-of-session review turn. */
-export function decideFinalReview(args: {
-	session: AmpSession
-	keptCount: number
-	turnStatus: 'done' | 'error' | 'cancelled'
-	turnLoggedExperiment: boolean
-	enabled: boolean
-}): boolean {
-	const { session, keptCount, turnStatus, turnLoggedExperiment, enabled } = args
-	return (
-		enabled &&
-		!session.finalReviewSent &&
-		turnStatus === 'done' &&
-		turnLoggedExperiment &&
-		keptCount > 0
-	)
+/**
+ * How many kept experiments a final review would cover, or 0 when the review
+ * is disabled, already sent, or there is nothing worth reviewing. Read-only:
+ * used both to gate the review and to phrase the Stop command's offer.
+ */
+export function finalReviewKeptCount(workdir: string, session: AmpSession): number {
+	if (session.finalReviewSent || !readFinalReview(workdir)) return 0
+	if (!fs.existsSync(logPath(workdir))) return 0
+	const state = reconstructJsonlState(fs.readFileSync(logPath(workdir), 'utf-8'))
+	return currentResults(state.results, state.currentSegment).filter((r) => r.status === 'keep')
+		.length
+}
+
+/**
+ * Claim the one-shot final review for a session: marks it sent on disk first
+ * (so a crash can't double-send), deactivates the session, and returns the
+ * review message. Returns null when nothing should be reviewed. Callers only
+ * deliver the message.
+ */
+export function claimFinalReview(workdir: string, session: AmpSession): string | null {
+	if (finalReviewKeptCount(workdir, session) === 0) return null
+	const state = reconstructJsonlState(fs.readFileSync(logPath(workdir), 'utf-8'))
+	writeSessionFile(workdir, { ...session, active: false, finalReviewSent: true })
+	stopDashboard(workdir)
+	return buildFinalReviewMessage(state, workdir)
 }
 
 /** True when a completed log_experiment tool call appears in the turn's messages. */
@@ -1623,25 +1643,11 @@ export default function (amp: PluginAPI) {
 
 		/** One-shot end-of-session oracle review of the kept experiments. */
 		const maybeFinalReview = (workdir: string, session: AmpSession) => {
-			if (!fs.existsSync(logPath(workdir))) return
-			const state = reconstructJsonlState(fs.readFileSync(logPath(workdir), 'utf-8'))
-			const kept = currentResults(state.results, state.currentSegment).filter(
-				(r) => r.status === 'keep',
-			)
-			const send = decideFinalReview({
-				session,
-				keptCount: kept.length,
-				turnStatus: event.status,
-				turnLoggedExperiment: logged,
-				enabled: readFinalReview(workdir),
-			})
-			if (!send) return
-			// Mark sent first so a crash between here and delivery can't double-send.
-			writeSessionFile(workdir, { ...session, active: false, finalReviewSent: true })
-			return {
-				action: 'continue' as const,
-				userMessage: buildFinalReviewMessage(state, workdir),
-			}
+			// Only turns that actually advanced the loop can end it into a review.
+			if (event.status !== 'done' || !logged) return
+			const message = claimFinalReview(workdir, session)
+			if (!message) return
+			return { action: 'continue' as const, userMessage: message }
 		}
 
 		const found = sessionForThread(event.thread.id)
@@ -1786,26 +1792,18 @@ export default function (amp: PluginAPI) {
 			const { workdir, session } = found
 			// Deliberate stop with a UI available: offer the wrap-up instead of
 			// silently skipping it (interrupts still skip by design).
-			const lp = logPath(workdir)
-			const state = reconstructJsonlState(fs.existsSync(lp) ? fs.readFileSync(lp, 'utf-8') : '')
-			const kept = currentResults(state.results, state.currentSegment).filter(
-				(r) => r.status === 'keep',
-			)
-			if (kept.length > 0 && readFinalReview(workdir) && !session.finalReviewSent && ctx.thread) {
+			const kept = finalReviewKeptCount(workdir, session)
+			if (kept > 0 && ctx.thread) {
 				const review = await ctx.ui
 					.confirm({
 						title: 'Run the final review first?',
-						message: `Ask the oracle to re-validate the ${kept.length} kept experiment${kept.length > 1 ? 's' : ''} against their complexity before stopping?`,
+						message: `Ask the oracle to re-validate the ${kept} kept experiment${kept > 1 ? 's' : ''} against their complexity before stopping?`,
 					})
 					.catch(() => false)
-				if (review) {
-					writeSessionFile(workdir, { ...session, active: false, finalReviewSent: true })
-					stopDashboard(workdir)
+				const message = review ? claimFinalReview(workdir, session) : null
+				if (message) {
 					try {
-						await ctx.thread.appendUserMessage({
-							type: 'user-message',
-							content: buildFinalReviewMessage(state, workdir),
-						})
+						await ctx.thread.appendUserMessage({ type: 'user-message', content: message })
 						await ctx.ui.notify('Autoresearch: stopped — final review turn sent.')
 					} catch {
 						await ctx.ui.notify('Autoresearch: stopped, but the review message could not be sent.')

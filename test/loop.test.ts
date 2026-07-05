@@ -136,28 +136,33 @@ test('kickoff prompts embed workdir, tool contract, and loop rules', async () =>
 	expect(resume).toContain('NEVER STOP')
 })
 
-test('final review fires once at session end with kept runs, suppressed on explicit stop', async () => {
-	const { buildFinalReviewMessage, decideFinalReview, deactivateSession, readSessionFile } =
+test('final review claims once at session end with kept runs, suppressed on explicit stop', async () => {
+	const { claimFinalReview, finalReviewKeptCount, deactivateSession, readSessionFile } =
 		await import('../autoresearch')
 	const { dir, session } = workdirWithSession('T-1')
-	const base = {
-		session,
-		keptCount: 2,
-		turnStatus: 'done' as const,
-		turnLoggedExperiment: true,
-		enabled: true,
-	}
-	expect(decideFinalReview(base)).toBe(true)
-	expect(decideFinalReview({ ...base, session: { ...session, finalReviewSent: true } })).toBe(false)
-	expect(decideFinalReview({ ...base, keptCount: 0 })).toBe(false)
-	expect(decideFinalReview({ ...base, turnStatus: 'cancelled' })).toBe(false)
-	expect(decideFinalReview({ ...base, turnLoggedExperiment: false })).toBe(false)
-	expect(decideFinalReview({ ...base, enabled: false })).toBe(false)
+	// The fixture log has one kept baseline run.
+	expect(finalReviewKeptCount(dir, session)).toBe(1)
+	expect(finalReviewKeptCount(dir, { ...session, finalReviewSent: true })).toBe(0)
+	// Claiming marks the session so a second claim returns nothing.
+	const msg = claimFinalReview(dir, session)
+	expect(msg).toContain('consult the oracle')
+	const after1 = readSessionFile(dir)!
+	expect(after1.active).toBe(false)
+	expect(after1.finalReviewSent).toBe(true)
+	expect(claimFinalReview(dir, after1)).toBeNull()
 	// Explicit stop suppresses the review permanently.
-	deactivateSession(dir, { suppressFinalReview: true })
-	const after = readSessionFile(dir)!
-	expect(after.active).toBe(false)
-	expect(after.finalReviewSent).toBe(true)
+	const { dir: dir2 } = workdirWithSession('T-2')
+	deactivateSession(dir2, { suppressFinalReview: true })
+	const after2 = readSessionFile(dir2)!
+	expect(after2.active).toBe(false)
+	expect(after2.finalReviewSent).toBe(true)
+	expect(finalReviewKeptCount(dir2, after2)).toBe(0)
+	// Config kill-switch.
+	const { dir: dir3, session: session3 } = workdirWithSession('T-3')
+	const fsMod = await import('node:fs')
+	const pathMod = await import('node:path')
+	fsMod.writeFileSync(pathMod.join(dir3, '.auto', 'config.json'), '{"finalReview": false}')
+	expect(finalReviewKeptCount(dir3, session3)).toBe(0)
 })
 
 test('final review message lists kept commits and forbids new experiments', async () => {
@@ -210,4 +215,17 @@ test('inflight marker readable, stale-guarded, and cleared by run_experiment', a
 	expect(readInflight(dir)).not.toBeNull()
 	fsMod.writeFileSync(inflightPath(dir), JSON.stringify({ startedAt: Date.now() - 60 * 60 * 1000 }))
 	expect(readInflight(dir)).toBeNull() // stale markers don't block forever
+})
+
+test('corrupt inflight marker fails closed via mtime', async () => {
+	const fsMod = await import('node:fs')
+	const osMod = await import('node:os')
+	const pathMod = await import('node:path')
+	const { inflightPath, readInflight } = await import('../autoresearch')
+	const dir = fsMod.mkdtempSync(pathMod.join(osMod.tmpdir(), 'ar-torn-'))
+	fsMod.mkdirSync(pathMod.join(dir, '.auto'))
+	fsMod.writeFileSync(inflightPath(dir), '{"startedA') // torn write
+	const r = readInflight(dir)
+	expect(r).not.toBeNull() // exists-but-corrupt counts as running
+	expect(Date.now() - r!.startedAt).toBeLessThan(60_000)
 })
