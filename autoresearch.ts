@@ -901,9 +901,23 @@ export function startDashboard(workdir: string): string {
 			return new Response('not found', { status: 404 })
 		},
 	})
+	const broadcast = () => {
+		for (const c of clients)
+			try {
+				c.enqueue(`event: jsonl-updated\ndata: ${Date.now()}\n\n`)
+			} catch {}
+	}
+	// Amp runs plugins in more than one host process; log_experiment may execute
+	// in a different process than this server, so in-process signaling cannot be
+	// the only trigger. Poll the log file — disk is the shared channel.
+	const lp = logPath(workdir)
+	fs.watchFile(lp, { interval: 1000 }, (cur, prev) => {
+		if (cur.mtimeMs !== prev.mtimeMs || cur.size !== prev.size) broadcast()
+	})
 	const entry: DashboardServer = {
 		port: server.port ?? 0,
 		stop: () => {
+			fs.unwatchFile(lp)
 			for (const c of clients)
 				try {
 					c.close()
@@ -912,12 +926,7 @@ export function startDashboard(workdir: string): string {
 			server.stop(true)
 			dashboards.delete(workdir)
 		},
-		broadcast: () => {
-			for (const c of clients)
-				try {
-					c.enqueue(`event: jsonl-updated\ndata: ${Date.now()}\n\n`)
-				} catch {}
-		},
+		broadcast,
 	}
 	dashboards.set(workdir, entry)
 	return `http://127.0.0.1:${entry.port}/`
@@ -1520,10 +1529,13 @@ export default function (amp: PluginAPI) {
 					await ctx.ui.notify('Autoresearch: open a thread first, then run this command.')
 					return
 				}
+				// process.cwd() is the plugin host's cwd (not the workspace), so it
+				// makes a misleading default; prefer the thread's bound session.
+				const bound = sessionForThread(ctx.thread.id)
 				const workdirInput = await ctx.ui.input({
 					title: 'Autoresearch working directory',
 					helpText: 'Absolute path to the git repository to experiment in.',
-					initialValue: process.cwd(),
+					initialValue: bound?.workdir ?? '',
 				})
 				if (!workdirInput) return
 				const workdir = path.resolve(workdirInput.trim())

@@ -16,9 +16,23 @@
   `AMP_AUTORESEARCH_ASSUME_YES=1` headless escape hatch, thread→workdir bindings
   index for reload recovery, command availability left static (no thread-switch
   event to drive `setAvailability`).
-- Remaining (needs an interactive client, cannot be driven headlessly): palette
-  dialog flow, `appendUserMessage` kickoff from the Start command, status-item
-  rendering, Ctrl-C mid-benchmark reaping.
+- Interactive smoke (2026-07-05, real TUI driven via tmux): palette dialogs work
+  (input + Opt+Y confirms); `appendUserMessage` kickoff works in interactive mode;
+  status item renders and live-updates; full cold start verified end-to-end — the
+  agent created the branch, wrote `.auto/` files including an output-validating
+  `checks.sh`, confirmed init, and ran 20+ real experiments reaching −37% on the
+  toy benchmark; loop survived a mid-turn `plugins: reload`.
+- **Dual plugin host processes discovered**: Amp loads the plugin in (at least) two
+  processes. Consequences found and handled: palette entries appear duplicated
+  (host-side, cosmetic — same handler either way), and the dashboard's SSE broadcast
+  originally relied on in-process signaling from `log_experiment`, which never fired
+  in the server's process → replaced with `fs.watchFile` on `log.jsonl` (disk is the
+  only channel the processes share). Start-dialog `initialValue` also switched from
+  `process.cwd()` (the plugin host's cwd, not the workspace) to the thread's bound
+  session workdir.
+- Remaining: cancel-mid-loop bounce-back check in the TUI (the `status !== 'done'`
+  gate is unit-tested; synthetic ESC via tmux send-keys did not reach Amp's
+  interrupt handling).
 
 ## Summary
 
