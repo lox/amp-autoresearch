@@ -490,7 +490,9 @@ function writeBinding(threadID: string, workdir: string): void {
 		const bindings = readBindings()
 		bindings[threadID] = workdir
 		fs.mkdirSync(path.dirname(bindingsFile), { recursive: true })
-		fs.writeFileSync(bindingsFile, `${JSON.stringify(bindings, null, 2)}\n`)
+		const tmp = `${bindingsFile}.${process.pid}.tmp`
+		fs.writeFileSync(tmp, `${JSON.stringify(bindings, null, 2)}\n`)
+		fs.renameSync(tmp, bindingsFile)
 	} catch {}
 }
 
@@ -536,9 +538,21 @@ export async function gitToplevel(dir: string): Promise<string | null> {
 }
 export async function gitIsDirty(dir: string): Promise<boolean> {
 	try {
-		return (await git(['status', '--porcelain'], dir)).stdout.trim().length > 0
+		// Exclude .auto/ — autoresearch's own state files (log.jsonl,
+		// amp-session.json) must not block re-init, mirroring the revert globs.
+		const args = [
+			'status',
+			'--porcelain',
+			'--',
+			'.',
+			':(exclude,glob)**/.auto',
+			':(exclude,glob)**/.auto/**',
+		]
+		return (await git(args, dir)).stdout.trim().length > 0
 	} catch {
-		return false
+		// Fail closed: a git error (timeout, huge status output) must refuse init
+		// rather than report clean — discards destroy uncommitted work.
+		return true
 	}
 }
 export async function gitCurrentBranch(dir: string): Promise<string | null> {
@@ -621,7 +635,11 @@ export async function runHook(
 		return { fired: false, exitCode: null, stdout: '', stderr: '', timedOut: false, durationMs: 0 }
 	const t0 = Date.now()
 	return await new Promise((resolve) => {
-		const child = spawn('bash', [script], { cwd: payload.cwd, stdio: ['pipe', 'pipe', 'pipe'] })
+		const child = spawn('bash', [script], {
+			cwd: payload.cwd,
+			detached: true, // group leader, so killTree reaps grandchildren on timeout
+			stdio: ['pipe', 'pipe', 'pipe'],
+		})
 		let stdout = Buffer.alloc(0),
 			stderr = '',
 			timedOut = false
@@ -633,7 +651,7 @@ export async function runHook(
 			if (stdout.length < 8192) stdout = Buffer.concat([stdout, b]).subarray(0, 8192)
 		})
 		child.stderr.on('data', (b: Buffer) => {
-			stderr += b.toString('utf8')
+			if (stderr.length < 8192) stderr = (stderr + b.toString('utf8')).slice(0, 8192)
 		})
 		child.on('close', (code) => {
 			clearTimeout(timer)
@@ -969,6 +987,17 @@ type ToolCtx = {
 }
 const unbound =
 	'No experiment session for this thread. Call init_experiment with the workspace root first.'
+/**
+ * Re-validate that this thread still owns the workdir's session (F2 in the
+ * final review): amp-session.json arbitrates across takeovers and across
+ * plugin processes (CLI + IDE); the in-memory binding alone must not authorize
+ * git-mutating tools.
+ */
+function ownershipError(threadID: string, workdir: string): string | null {
+	const s = readSessionFile(workdir)
+	if (s?.active && s.threadID === threadID) return null
+	return `❌ This thread no longer holds the autoresearch session in ${workdir}. Call init_experiment to rebind.`
+}
 /** Coerce agent-supplied seconds to a positive finite number, else the default. */
 function positiveSeconds(value: unknown, fallback: number): number {
 	const n = Number(value)
@@ -1102,6 +1131,8 @@ export async function executeRun(input: Record<string, unknown>, ctx: ToolCtx): 
 	const rt = runtimeForThread(ctx.thread.id)
 	if (!rt) return unbound
 	const workdir = rt.workdir
+	const owner = ownershipError(ctx.thread.id, workdir)
+	if (owner) return owner
 	if (!fs.existsSync(measurePath(workdir)))
 		return '❌ Missing .auto/measure.sh. Write a benchmark script that emits METRIC name=value lines and commit it first.'
 	const state = readState(workdir),
@@ -1223,6 +1254,8 @@ export async function executeLog(input: Record<string, unknown>, ctx: ToolCtx): 
 	try {
 		const rt = runtimeForThread(ctx.thread.id)
 		if (!rt) return unbound
+		const owner = ownershipError(ctx.thread.id, rt.workdir)
+		if (owner) return owner
 		const workdir = rt.workdir,
 			state = readState(workdir),
 			metrics = isObjectRecord(input.metrics) ? metricMapFrom(input.metrics) : {}
@@ -1280,8 +1313,14 @@ export async function executeLog(input: Record<string, unknown>, ctx: ToolCtx): 
 			onExperimentLogged?.(workdir)
 		} catch {}
 		if (status !== 'keep') {
-			await gitRevertAll(workdir)
-			gitLine = `📝 Git: reverted changes (${status}) — .auto/ preserved`
+			// The jsonl entry is already persisted; a revert failure must not throw
+			// into the outer catch, or an agent retry would duplicate the run entry.
+			try {
+				await gitRevertAll(workdir)
+				gitLine = `📝 Git: reverted changes (${status}) — .auto/ preserved`
+			} catch (e) {
+				gitLine = `⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)} — revert manually before the next experiment`
+			}
 		}
 		const h = await runHook({
 			event: 'after',

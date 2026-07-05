@@ -90,6 +90,17 @@ test('run_experiment refuses unbound/missing and parses real measure.sh', async 
 	expect(await executeRun({}, ctx)).toContain('No experiment session')
 	const dir = repo()
 	bindThreadSession('T-test', dir)
+	// Binding alone is not ownership: the session file must name this thread.
+	expect(await executeRun({}, ctx)).toContain('no longer holds')
+	const { writeSessionFile } = await import('../autoresearch')
+	writeSessionFile(dir, {
+		version: 1,
+		threadID: 'T-test',
+		workdir: dir,
+		active: true,
+		autoResumeTurns: 0,
+		activatedAt: Date.now(),
+	})
 	expect(await executeRun({}, ctx)).toContain('Missing .auto/measure.sh')
 	fs.mkdirSync(path.join(dir, '.auto'), { recursive: true })
 	fs.writeFileSync(path.join(dir, '.auto', 'measure.sh'), 'echo METRIC x=1\n')
@@ -162,4 +173,50 @@ test('init refuses dirty worktree and resumes without duplicate header', async (
 		.split('\n')
 		.filter((l: string) => l.includes('"type":"config"'))
 	expect(headers.length).toBe(1)
+})
+
+test('init refuses foreign active session without confirm, takes over with confirm', async () => {
+	const { executeInit, readSessionFile } = await import('../autoresearch')
+	const dir = repo()
+	execFileSync('git', ['checkout', '-b', 'autoresearch/test'], { cwd: dir })
+	const yes = { ...ctx, ui: { confirm: async () => true } }
+	await executeInit({ working_dir: dir, name: 'T', metric_name: 'ms' }, yes)
+	// A second thread with a declining user is refused
+	const otherNo = {
+		ui: { confirm: async () => false },
+		thread: { ...ctx.thread, id: 'T-other' },
+	}
+	expect(await executeInit({ working_dir: dir, name: 'T', metric_name: 'ms' }, otherNo)).toContain(
+		'held by thread T-test',
+	)
+	expect(readSessionFile(dir)?.threadID).toBe('T-test')
+	// With confirmation the session transfers
+	const otherYes = {
+		ui: { confirm: async () => true },
+		thread: { ...ctx.thread, id: 'T-other' },
+	}
+	expect(await executeInit({ working_dir: dir, name: 'T', metric_name: 'ms' }, otherYes)).toContain(
+		'✅',
+	)
+	expect(readSessionFile(dir)?.threadID).toBe('T-other')
+})
+
+test('stale binding after takeover refuses run/log (ownership re-validation)', async () => {
+	const { executeInit, executeRun, executeLog } = await import('../autoresearch')
+	const dir = repo()
+	execFileSync('git', ['checkout', '-b', 'autoresearch/test'], { cwd: dir })
+	fs.mkdirSync(path.join(dir, '.auto'), { recursive: true })
+	fs.writeFileSync(path.join(dir, '.auto', 'measure.sh'), 'echo METRIC x=1\n')
+	const yes = { ...ctx, ui: { confirm: async () => true } }
+	await executeInit({ working_dir: dir, name: 'T', metric_name: 'ms' }, yes)
+	// Another thread takes over; T-test's in-memory binding is now stale.
+	const otherYes = {
+		ui: { confirm: async () => true },
+		thread: { ...ctx.thread, id: 'T-other' },
+	}
+	await executeInit({ working_dir: dir, name: 'T', metric_name: 'ms' }, otherYes)
+	expect(await executeRun({}, ctx)).toContain('no longer holds')
+	expect(
+		await executeLog({ commit: 'abc1234', metric: 1, status: 'discard', description: 'x' }, ctx),
+	).toContain('no longer holds')
 })

@@ -2,8 +2,23 @@
 
 **Reference implementation:** [pi-autoresearch](https://github.com/davebcn87/pi-autoresearch) v1.6.1
 **Plugin API reference:** `amp plugins show-docs` (also https://ampcode.com/manual/plugin-api)
-**Status:** Proposed
+**Status:** Landed (slices 0–6; interactive-mode smoke items remain — see Progress)
 **Last reviewed:** 2026-07-05
+
+## Progress snapshot
+
+- Slices 0–6 implemented and committed; 48 unit/integration tests green, tsc clean.
+- Host smoke (execute mode): 4-run loop via 3 chained continues with post-commit shas
+  matching git log; resume/takeover run continued the same segment (no duplicate
+  config header) and honored `maxIterations`; dashboard/status item register.
+- Implementation deltas discovered while building, all reflected in this plan and
+  README: `gitIsDirty` excludes `.auto/` (own state files must not block re-init),
+  `AMP_AUTORESEARCH_ASSUME_YES=1` headless escape hatch, thread→workdir bindings
+  index for reload recovery, command availability left static (no thread-switch
+  event to drive `setAvailability`).
+- Remaining (needs an interactive client, cannot be driven headlessly): palette
+  dialog flow, `appendUserMessage` kickoff from the Start command, status-item
+  rendering, Ctrl-C mid-benchmark reaping.
 
 ## Summary
 
@@ -579,7 +594,22 @@ latency for in-flight benchmarks); final oracle code review.
 
 ## Key learnings from pressure-testing
 
-Two adversarial passes were run; all corrections are folded in above.
+Three adversarial passes were run; all corrections are folded in above.
+
+**Round 3 (oracle review of the finished implementation):**
+
+- **`gitIsDirty` failed open** — a git error (timeout, >1MB porcelain output) reported
+  clean, defeating the one guard protecting uncommitted work → fail closed.
+- **In-memory bindings alone authorized git-mutating tools** — after a takeover (or
+  from a second Amp client process) a stale thread could still revert the new owner's
+  work → run/log re-validate ownership against `amp-session.json` on every call,
+  which also closes the cross-process single-flight gap.
+- Smaller fixes: bindings index writes are temp+rename; a revert failure after the
+  jsonl append no longer throws (agent retries would duplicate entries); hook
+  subprocesses are group leaders so timeouts reap grandchildren; hook stderr capped.
+- **Accepted semantic (F6)**: a `log_experiment` call that returned a refusal string
+  still counts as "logged" for auto-resume gating (tool status is `done`); benign —
+  bounded by the cap, and the resume message drives correction.
 
 **Round 2 (adversarial review of this plan):**
 
