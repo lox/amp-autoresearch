@@ -440,6 +440,26 @@ tool `execute` (needed for orphaned-benchmark reaping).
 
 **Done when:** each behavior confirmed or a workaround chosen and recorded in this plan.
 
+**Results (2026-07-05, spike run against the live CLI in `-x` mode):**
+
+1. ✅ `agent.end → {action:'continue'}` chains cleanly: 3 consecutive continue turns,
+   host waits for the whole chain before exiting execute mode.
+2. ✅ `agent.start` fires for continue-originated turns. ⚠️ In 1 of 3 runs it did not
+   fire for the *first* turn (likely a handler-registration race on fast startup) —
+   confirms injection must stay best-effort, which the self-contained resume messages
+   already handle.
+3. ✅ No hidden tool timeout: a 310s tool execution completed normally.
+4. ✅ Plugin tools run with **no approval prompt** — confirms the measure.sh-only
+   restriction is necessary; README must state it prominently.
+5. ⚠️ **`thread.appendUserMessage` and `thread.state` fail in execute mode** with
+   "not available - no active thread" (from both tool and `agent.end` handler
+   contexts). They depend on an active (UI-focused) thread. Consequences:
+   - `run_experiment`'s thread-state polling must degrade to kill-timer-only when
+     state is unavailable (wrap in try/catch).
+   - The `start` command's kickoff append gets a fallback: on failure, notify the
+     user to send the kickoff text manually.
+   - Interactive-mode behavior of both APIs is verified at the Slice 4 smoke test.
+
 ### Slice 1 — Scaffold + state core
 
 Repo scaffold, Makefile (symlink install), and the pure core: jsonl
