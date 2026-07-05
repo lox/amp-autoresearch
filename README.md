@@ -1,52 +1,72 @@
 # amp-autoresearch
 
-An [Amp](https://ampcode.com) plugin that runs an autonomous optimization loop: the
-agent edits code, runs a benchmark, records the result, auto-commits improvements,
-auto-reverts regressions, and repeats until interrupted or capped.
+An [Amp](https://ampcode.com) plugin that turns the agent into an autonomous
+optimization loop: edit code, run the benchmark, log the result, keep what improves,
+revert what doesn't — and repeat until interrupted or capped. You describe the goal;
+the agent sets up the harness, takes a baseline, and grinds through hypotheses while
+you watch the metric fall.
+
+![Live dashboard mid-session: 23 runs into optimizing a Python benchmark, 37% below baseline](assets/screenshot.png)
 
 A port of [pi-autoresearch](https://github.com/davebcn87/pi-autoresearch) to Amp's
-plugin API, with the same `.auto/` session file format.
+plugin API, sharing the same `.auto/` session file format — logs and dashboards work
+across both agents.
 
 ```
 edit code → run_experiment → log_experiment → keep or revert → repeat
 ```
 
-## Install
+## Quick start
 
 ```sh
+git clone <this repo> && cd amp-autoresearch
 mise run install    # symlinks autoresearch.ts into ~/.config/amp/plugins/
 ```
 
-Then restart Amp or run `plugins: reload` from the command palette. The symlink matters:
-the browser dashboard asset (`assets/dashboard.html`) is resolved through the symlink
-back to this checkout.
+Restart Amp (or `plugins: reload` from the command palette), open a thread, then run
+**`Autoresearch: Start`** from the palette. It asks for a working directory and a
+one-sentence goal, and the agent does the rest: creates a branch, writes the session
+playbook and benchmark script, takes a baseline, and starts looping.
 
-## Usage
+Install by symlink, not copy — the dashboard asset (`assets/dashboard.html`) resolves
+through the symlink back to this checkout.
 
-From the command palette:
+## Watching it run
+
+| Surface | What you get |
+|---|---|
+| Thread | A scoreboard after every experiment: metric, delta vs baseline/best, verdict, confidence, recent runs. |
+| Status bar | One line, always current: `🔬 23 runs · best 13.5ms (−37%) · conf 26.8×`. Click it for the dashboard. |
+| Browser dashboard | The screenshot above: live metric trace with baseline/best reference lines, stat cards, and an expandable run log with the agent's per-run notes. Updates over SSE as runs land. `Autoresearch: Dashboard` opens it. |
+
+Every run carries **ASI** ("actionable side information") — the agent's notes on what
+it learned, why it worked or didn't, and what to try next. Discarded code is reverted,
+so these notes are the only trace of dead ends; click any dashboard row to read them.
+
+## Commands
 
 | Command | Does |
 |---|---|
-| `Autoresearch: Start` | Asks for a working directory and goal, then sends the kickoff message. Resumes automatically when `.auto/prompt.md` exists. |
-| `Autoresearch: Stop` | Deactivates the current thread's session. |
+| `Autoresearch: Start` | Start a new session, or resume when `.auto/prompt.md` exists. |
+| `Autoresearch: Stop` | Deactivate the current thread's session. |
 | `Autoresearch: Status` | One-glance digest: runs, baseline, best, confidence. |
-| `Autoresearch: Dashboard` | Opens the live browser dashboard (charts, run table, SSE updates). |
-| `Autoresearch: Clear log` | Deletes `.auto/log.jsonl` and deactivates. Kept commits stay in git. |
+| `Autoresearch: Dashboard` | Open the live browser dashboard. |
+| `Autoresearch: Clear log` | Delete `.auto/log.jsonl` and deactivate. Kept commits stay in git. |
 
-The agent then sets up the session itself: creates a branch, writes `.auto/prompt.md`
-(the session playbook) and `.auto/measure.sh` (the benchmark), takes a baseline, and
-loops. After every turn that logged an experiment, the plugin automatically sends
-"run the next iteration" — capped at 20 auto-resumes by default (see config below);
-any real message from you resets the cap.
+After any turn that logged an experiment, the plugin automatically prompts the next
+iteration — capped at 20 auto-resumes by default; any real message from you resets the
+cap. The agent stops cleanly at `maxIterations`, on `Stop`, or when you interrupt.
 
-### Headless (execute mode)
+### Headless / overnight runs
 
 `amp -x` sessions have no UI, so confirmation dialogs fail closed and the loop won't
-start. Opt in explicitly for unattended runs:
+start. Opt in explicitly:
 
 ```sh
 AMP_AUTORESEARCH_ASSUME_YES=1 amp -x "Set up and run an autoresearch loop: <goal> in $(pwd)…"
 ```
+
+Raise `maxAutoResumeTurns` (below) for long unattended runs.
 
 ## Session files (`.auto/`)
 
@@ -63,8 +83,8 @@ Byte-compatible with pi-autoresearch (current layout; no legacy flat files).
 | `hooks/before.sh`, `hooks/after.sh` | Optional lifecycle hooks: JSON payload on stdin, stdout is fed back to the agent |
 | `amp-session.json` | Amp-only: session/lock record binding the workdir to one thread |
 
-Gitignore `log.jsonl` and `amp-session.json` (the kickoff prompt instructs the agent to
-do this); commit `prompt.md` and `measure.sh`.
+Gitignore `log.jsonl` and `amp-session.json` (the kickoff prompt instructs the agent
+to); commit `prompt.md` and `measure.sh`.
 
 ### `config.json`
 
@@ -77,8 +97,7 @@ do this); commit `prompt.md` and `measure.sh`.
 ```
 
 - `maxIterations` — stop the loop after this many experiments (pi-compatible).
-- `maxAutoResumeTurns` — auto-resume cap per user interaction, default 20 (Amp-only;
-  raise for overnight runs).
+- `maxAutoResumeTurns` — auto-resume cap per user interaction, default 20 (Amp-only).
 - `workingDir` — redirect all session I/O and git operations (pi-compatible).
 
 ## Tools
@@ -88,6 +107,10 @@ do this); commit `prompt.md` and `measure.sh`.
 | `init_experiment` | Binds a session to the thread. Takes `working_dir` (Amp exposes no cwd to plugins), name, metric, direction. Validates the git repo, refuses dirty worktrees, confirms takeovers and first activations. |
 | `run_experiment` | Runs `.auto/measure.sh` (only — see safety), times it, parses `METRIC` lines, runs `checks.sh`, truncates output. |
 | `log_experiment` | Appends to `log.jsonl`; `keep` → `git add -A && git commit`; anything else → revert everything except `.auto/`. Computes a MAD-based confidence score. |
+
+**Confidence** is `|best − baseline| / MAD(run metrics)` — a signal-to-noise ratio,
+not a p-value. ≥2× means the win comfortably clears the benchmark's run-to-run jitter;
+<1× means it's indistinguishable from noise. Advisory only: it never auto-discards.
 
 ## Safety model
 
@@ -99,9 +122,11 @@ do this); commit `prompt.md` and `measure.sh`.
 - `init_experiment` hard-refuses dirty worktrees: discards run `git checkout -- .` and
   `git clean -fd` (excluding `.auto/`), which destroy uncommitted work.
 - One active session per working directory (`.auto/amp-session.json` is the lock);
-  one experiment in flight at a time; takeover requires confirmation.
-- Auto-resume never overrides a cancelled or errored turn, and stops when the session's
-  on-disk log disappears (e.g. after a branch switch).
+  one experiment in flight at a time; takeovers require confirmation, and tools
+  re-validate session ownership on every call — a stale thread can never revert the
+  new owner's work.
+- Auto-resume never overrides a cancelled or errored turn, and fails closed when the
+  session's on-disk log disappears (e.g. after a branch switch).
 - Cancelling a turn does **not** instantly kill an in-flight benchmark — Amp gives
   plugin tools no abort signal. The plugin polls thread state where available and
   always enforces the benchmark timeout (default 600s).
@@ -129,4 +154,5 @@ mise run typecheck
 mise run fmt        # prettier
 ```
 
-Design/plan: [docs/plans/amp-autoresearch.md](docs/plans/amp-autoresearch.md).
+Design/plan (including three rounds of adversarial-review findings):
+[docs/plans/amp-autoresearch.md](docs/plans/amp-autoresearch.md).
