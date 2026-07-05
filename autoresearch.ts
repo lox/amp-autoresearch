@@ -811,7 +811,7 @@ export function buildCreateKickoff(goal: string, workdir: string): string {
    - Add \`.auto/log.jsonl\` and \`.auto/amp-session.json\` to .gitignore.
    - Only if constraints require correctness validation, write \`.auto/checks.sh\` (runs after every passing benchmark; keep output minimal — errors only).
    Commit these files.
-5. Call \`init_experiment\` with working_dir set to the workspace root (${workdir}), plus name, metric_name, metric_unit, direction.
+5. Call \`init_experiment\` with working_dir set to the workspace root (${workdir}), plus name, metric_name, metric_unit, direction. Pick a unit that puts typical values in the 1–1000 range so dashboards and deltas stay readable: measure a ~0.014s benchmark as \`wall_ms\` ≈ 14, not \`wall_seconds\` ≈ 0.014.
 6. Run the baseline: \`run_experiment\` (it always executes \`.auto/measure.sh\`), then \`log_experiment\` with status keep.
 7. Loop: edit code → run_experiment → log_experiment (keep improves, discard regresses — reverts are automatic; never commit or revert manually).
 
@@ -1386,9 +1386,16 @@ export default function (amp: PluginAPI) {
 					type: 'string',
 					description: 'Absolute path to the workspace root (must be a git repository)',
 				},
-				name: { type: 'string' },
-				metric_name: { type: 'string' },
-				metric_unit: { type: 'string' },
+				name: { type: 'string', description: 'Human-readable session name' },
+				metric_name: {
+					type: 'string',
+					description:
+						'Primary metric name, e.g. "wall_ms". Choose a unit scale that puts typical values in the 1-1000 range (wall_ms=14, not wall_seconds=0.014).',
+				},
+				metric_unit: {
+					type: 'string',
+					description: 'Display unit, e.g. "ms", "µs", "kb". Default: unitless.',
+				},
 				direction: { type: 'string', enum: ['lower', 'higher'] },
 			},
 			required: ['working_dir', 'name', 'metric_name'],
