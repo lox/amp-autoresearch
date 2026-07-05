@@ -135,3 +135,44 @@ test('kickoff prompts embed workdir, tool contract, and loop rules', async () =>
 	expect(resume).toContain('working_dir=/repo')
 	expect(resume).toContain('NEVER STOP')
 })
+
+test('final review fires once at session end with kept runs, suppressed on explicit stop', async () => {
+	const { buildFinalReviewMessage, decideFinalReview, deactivateSession, readSessionFile } =
+		await import('../autoresearch')
+	const { dir, session } = workdirWithSession('T-1')
+	const base = {
+		session,
+		keptCount: 2,
+		turnStatus: 'done' as const,
+		turnLoggedExperiment: true,
+		enabled: true,
+	}
+	expect(decideFinalReview(base)).toBe(true)
+	expect(decideFinalReview({ ...base, session: { ...session, finalReviewSent: true } })).toBe(false)
+	expect(decideFinalReview({ ...base, keptCount: 0 })).toBe(false)
+	expect(decideFinalReview({ ...base, turnStatus: 'cancelled' })).toBe(false)
+	expect(decideFinalReview({ ...base, turnLoggedExperiment: false })).toBe(false)
+	expect(decideFinalReview({ ...base, enabled: false })).toBe(false)
+	// Explicit stop suppresses the review permanently.
+	deactivateSession(dir, { suppressFinalReview: true })
+	const after = readSessionFile(dir)!
+	expect(after.active).toBe(false)
+	expect(after.finalReviewSent).toBe(true)
+})
+
+test('final review message lists kept commits and forbids new experiments', async () => {
+	const { buildFinalReviewMessage, reconstructJsonlState } = await import('../autoresearch')
+	const state = reconstructJsonlState(
+		'{"type":"config","name":"S","metricName":"tti_ms","metricUnit":"ms"}\n' +
+			'{"run":1,"commit":"aaa1111","metric":100,"status":"keep","description":"baseline","timestamp":1}\n' +
+			'{"run":2,"commit":"bbb2222","metric":60,"status":"keep","description":"big win","timestamp":2}\n' +
+			'{"run":3,"commit":"ccc3333","metric":80,"status":"discard","description":"nope","timestamp":3}\n',
+	)
+	const msg = buildFinalReviewMessage(state, '/repo')
+	expect(msg).toContain('Do NOT run more experiments')
+	expect(msg).toContain('consult the oracle')
+	expect(msg).toContain('bbb2222')
+	expect(msg).toContain('-40.0%')
+	expect(msg).not.toContain('ccc3333')
+	expect(msg).toContain('Do not revert anything without')
+})

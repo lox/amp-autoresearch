@@ -57,6 +57,13 @@ After any turn that logged an experiment, the plugin automatically prompts the n
 iteration — capped at 20 auto-resumes by default; any real message from you resets the
 cap. The agent stops cleanly at `maxIterations`, on `Stop`, or when you interrupt.
 
+When a session ends on its own (`maxIterations` or the resume cap) with kept
+experiments, the plugin sends **one final review turn**: the agent takes the kept
+commits, their diffs, and the run log to the oracle and re-validates each win against
+its complexity cost — keep, simplify, or recommend reverting (it never reverts without
+asking). Verdicts land in `.auto/ideas.md`. Explicit `Stop`/`Clear` skip it; disable
+with `"finalReview": false` in `.auto/config.json`.
+
 ### Headless / overnight runs
 
 `amp -x` sessions have no UI, so confirmation dialogs fail closed and the loop won't
@@ -92,12 +99,14 @@ to); commit `prompt.md` and `measure.sh`.
 {
   "maxIterations": 50,
   "maxAutoResumeTurns": 100,
+  "finalReview": true,
   "workingDir": "/path/to/project"
 }
 ```
 
 - `maxIterations` — stop the loop after this many experiments (pi-compatible).
 - `maxAutoResumeTurns` — auto-resume cap per user interaction, default 20 (Amp-only).
+- `finalReview` — end-of-session oracle review of kept experiments, default true (Amp-only).
 - `workingDir` — redirect all session I/O and git operations (pi-compatible).
 
 ## Tools

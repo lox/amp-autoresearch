@@ -49,6 +49,7 @@ export interface AutoConfig {
 	maxIterations?: number
 	workingDir?: string
 	maxAutoResumeTurns?: number
+	finalReview?: boolean
 }
 export interface AmpSession {
 	version: 1
@@ -57,6 +58,8 @@ export interface AmpSession {
 	active: boolean
 	autoResumeTurns: number
 	activatedAt: number
+	/** Set once the end-of-session oracle review turn has been sent (or suppressed). */
+	finalReviewSent?: boolean
 }
 
 const DEFAULT_METRIC_NAME = 'metric'
@@ -398,6 +401,10 @@ export function readMaxExperiments(workdir: string): number | null {
 export function readMaxAutoResumeTurns(workdir: string): number {
 	const v = readConfig(workdir).maxAutoResumeTurns
 	return typeof v === 'number' && v > 0 ? Math.floor(v) : DEFAULT_MAX_AUTO_RESUME_TURNS
+}
+/** Whether the end-of-session oracle review is enabled (default true). */
+export function readFinalReview(workdir: string): boolean {
+	return readConfig(workdir).finalReview !== false
 }
 /** Resolve configured workingDir absolute/relative to initDir, else initDir. */
 export function resolveWorkDir(initDir: string): string {
@@ -975,6 +982,54 @@ export function decideContinue(args: {
 	return { action: 'continue', userMessage: composeResumeMessage(buildDigest(state)) }
 }
 
+/**
+ * Build the one-shot end-of-session review turn: send the kept experiments to
+ * the oracle and re-validate each win against its complexity cost.
+ */
+export function buildFinalReviewMessage(state: SessionState, workdir: string): string {
+	const runs = currentResults(state.results, state.currentSegment)
+	const kept = runs.filter((r) => r.status === 'keep')
+	const keptLines = kept.map(
+		(r) =>
+			`- #${r.run} ${r.commit} ${formatNum(r.metric, state.metricUnit)}${formatDelta(r.metric, findBaselineMetric(state.results, state.currentSegment))} — ${r.description}`,
+	)
+	return [
+		'The autoresearch session has ended. Do NOT run more experiments.',
+		'',
+		'Final step: consult the oracle to re-validate the kept experiments. Give it the',
+		`kept commits below, the run log (${logPath(workdir)}), the diffs of each kept`,
+		'commit, and the session rules (.auto/prompt.md). Ask it, for each kept change:',
+		'is the measured win worth the added complexity, and did any secondary metric',
+		'or benchmark-shape assumption quietly regress?',
+		'',
+		'Kept experiments:',
+		...keptLines,
+		'',
+		'Then report: which commits to keep as-is, which to simplify or squash, and',
+		'which to revert as not worth their complexity. Append the verdicts to',
+		'.auto/ideas.md under a "Final review" heading. Do not revert anything without',
+		'asking the user first.',
+	].join('\n')
+}
+
+/** Decide whether to send the one-shot end-of-session review turn. */
+export function decideFinalReview(args: {
+	session: AmpSession
+	keptCount: number
+	turnStatus: 'done' | 'error' | 'cancelled'
+	turnLoggedExperiment: boolean
+	enabled: boolean
+}): boolean {
+	const { session, keptCount, turnStatus, turnLoggedExperiment, enabled } = args
+	return (
+		enabled &&
+		!session.finalReviewSent &&
+		turnStatus === 'done' &&
+		turnLoggedExperiment &&
+		keptCount > 0
+	)
+}
+
 /** True when a completed log_experiment tool call appears in the turn's messages. */
 export function turnLoggedExperiment(
 	toolCalls: Array<{ call: { tool: string }; result: { status: string } }>,
@@ -983,9 +1038,14 @@ export function turnLoggedExperiment(
 }
 
 /** Mark a session inactive on disk and tear down its dashboard. */
-export function deactivateSession(workdir: string): void {
+export function deactivateSession(workdir: string, opts?: { suppressFinalReview?: boolean }): void {
 	const s = readSessionFile(workdir)
-	if (s?.active) writeSessionFile(workdir, { ...s, active: false })
+	if (s && (s.active || (opts?.suppressFinalReview && !s.finalReviewSent)))
+		writeSessionFile(workdir, {
+			...s,
+			active: false,
+			finalReviewSent: opts?.suppressFinalReview ? true : s.finalReviewSent,
+		})
 	stopDashboard(workdir)
 }
 
@@ -1496,14 +1556,47 @@ export default function (amp: PluginAPI) {
 		},
 		ctx: { ui: { notify: (m: string) => Promise<void> } },
 	) => {
+		const logged = turnLoggedExperiment(amp.helpers.toolCallsInMessages(event.messages))
+
+		/** One-shot end-of-session oracle review of the kept experiments. */
+		const maybeFinalReview = (workdir: string, session: AmpSession) => {
+			if (!fs.existsSync(logPath(workdir))) return
+			const state = reconstructJsonlState(fs.readFileSync(logPath(workdir), 'utf-8'))
+			const kept = currentResults(state.results, state.currentSegment).filter(
+				(r) => r.status === 'keep',
+			)
+			const send = decideFinalReview({
+				session,
+				keptCount: kept.length,
+				turnStatus: event.status,
+				turnLoggedExperiment: logged,
+				enabled: readFinalReview(workdir),
+			})
+			if (!send) return
+			// Mark sent first so a crash between here and delivery can't double-send.
+			writeSessionFile(workdir, { ...session, active: false, finalReviewSent: true })
+			return {
+				action: 'continue' as const,
+				userMessage: buildFinalReviewMessage(state, workdir),
+			}
+		}
+
 		const found = sessionForThread(event.thread.id)
-		if (!found) return
+		if (!found) {
+			// The session may have deactivated itself this turn (maxIterations in
+			// log_experiment). The in-memory binding still knows the workdir.
+			const workdir = boundWorkdirForThread(event.thread.id)
+			const session = workdir ? readSessionFile(workdir) : null
+			if (workdir && session && !session.active && session.threadID === event.thread.id)
+				return maybeFinalReview(workdir, session)
+			return
+		}
 		const { workdir, session } = found
 		const decision = decideContinue({
 			session,
 			workdir,
 			turnStatus: event.status,
-			turnLoggedExperiment: turnLoggedExperiment(amp.helpers.toolCallsInMessages(event.messages)),
+			turnLoggedExperiment: logged,
 			maxTurns: readMaxAutoResumeTurns(workdir),
 		})
 		switch (decision.action) {
@@ -1514,9 +1607,10 @@ export default function (amp: PluginAPI) {
 				deactivateSession(workdir)
 				await notify(ctx, decision.notice!)
 				return
-			case 'stop-cap':
+			case 'stop-cap': {
 				await notify(ctx, decision.notice!)
-				return
+				return maybeFinalReview(workdir, session)
+			}
 			case 'none':
 				return
 		}
@@ -1626,7 +1720,7 @@ export default function (amp: PluginAPI) {
 				await ctx.ui.notify('Autoresearch: no active session for this thread.')
 				return
 			}
-			deactivateSession(found.workdir)
+			deactivateSession(found.workdir, { suppressFinalReview: true })
 			await ctx.ui.notify(`Autoresearch: session in ${found.workdir} stopped.`)
 		},
 	)
@@ -1656,7 +1750,7 @@ export default function (amp: PluginAPI) {
 			} catch (e) {
 				amp.logger.log(`autoresearch-clear failed: ${e}`)
 			}
-			deactivateSession(found.workdir)
+			deactivateSession(found.workdir, { suppressFinalReview: true })
 			await ctx.ui.notify('Autoresearch: log cleared, session deactivated.')
 		},
 	)
