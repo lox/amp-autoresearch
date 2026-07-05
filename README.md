@@ -26,7 +26,8 @@ mise run install    # symlinks autoresearch.ts into ~/.config/amp/plugins/
 Restart Amp (or `plugins: reload` from the command palette), open a thread, then run
 **`Autoresearch: Start`** from the palette. It asks for a working directory and a
 one-sentence goal, and the agent does the rest: creates a branch, writes the session
-playbook and benchmark script, takes a baseline, and starts looping.
+playbook and benchmark script, takes a baseline, and starts looping. Fresh sessions
+open the browser dashboard automatically.
 
 Install by symlink, not copy — the dashboard asset (`assets/dashboard.html`) resolves
 through the symlink back to this checkout.
@@ -43,12 +44,17 @@ Every run carries **ASI** ("actionable side information") — the agent's notes 
 it learned, why it worked or didn't, and what to try next. Discarded code is reverted,
 so these notes are the only trace of dead ends; click any dashboard row to read them.
 
+Diagnostic runs (instrumentation, noise re-measurements) are tagged
+`asi: {kind: "probe"}` and tallied separately from failed attempts — 25 discards where
+5 were probes tells a different story than 25 failures. The dashboard shows an amber
+"measuring" pulse while a benchmark is in flight.
+
 ## Commands
 
 | Command | Does |
 |---|---|
 | `Autoresearch: Start` | Start a new session, or resume when `.auto/prompt.md` exists. |
-| `Autoresearch: Stop` | Deactivate the current thread's session. |
+| `Autoresearch: Stop` | Deactivate the session — offers to run the final oracle review of kept experiments first. |
 | `Autoresearch: Status` | One-glance digest: runs, baseline, best, confidence. |
 | `Autoresearch: Dashboard` | Open the live browser dashboard. |
 | `Autoresearch: Clear log` | Delete `.auto/log.jsonl` and deactivate. Kept commits stay in git. |

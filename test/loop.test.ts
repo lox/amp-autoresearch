@@ -176,3 +176,38 @@ test('final review message lists kept commits and forbids new experiments', asyn
 	expect(msg).not.toContain('ccc3333')
 	expect(msg).toContain('Do not revert anything without')
 })
+
+test('probe runs are tallied separately in the digest', async () => {
+	const { buildDigest, reconstructJsonlState } = await import('../autoresearch')
+	const state = reconstructJsonlState(
+		'{"type":"config","name":"S","metricName":"ms","metricUnit":"ms"}\n' +
+			'{"run":1,"commit":"a","metric":100,"status":"keep","description":"base","timestamp":1}\n' +
+			'{"run":2,"commit":"b","metric":100,"status":"discard","description":"instrument","timestamp":2,"asi":{"kind":"probe"}}\n' +
+			'{"run":3,"commit":"c","metric":110,"status":"discard","description":"worse","timestamp":3}\n',
+	)
+	const d = buildDigest(state)
+	expect(d).toContain('runs: 3 (1 keep, 1 discard, 0 crash, 1 probe)')
+})
+
+test('kickoff includes probe convention and default iteration budget', async () => {
+	const { buildCreateKickoff } = await import('../autoresearch')
+	const k = buildCreateKickoff('goal', '/repo')
+	expect(k).toContain('asi: {kind: "probe"')
+	expect(k).toContain('"maxIterations": 30')
+	expect(k).toContain('probes don\x27t count')
+	expect(k).toContain('amp-inflight.json')
+})
+
+test('inflight marker readable, stale-guarded, and cleared by run_experiment', async () => {
+	const fsMod = await import('node:fs')
+	const osMod = await import('node:os')
+	const pathMod = await import('node:path')
+	const { inflightPath, readInflight } = await import('../autoresearch')
+	const dir = fsMod.mkdtempSync(pathMod.join(osMod.tmpdir(), 'ar-inflight-'))
+	fsMod.mkdirSync(pathMod.join(dir, '.auto'))
+	expect(readInflight(dir)).toBeNull()
+	fsMod.writeFileSync(inflightPath(dir), JSON.stringify({ startedAt: Date.now() }))
+	expect(readInflight(dir)).not.toBeNull()
+	fsMod.writeFileSync(inflightPath(dir), JSON.stringify({ startedAt: Date.now() - 60 * 60 * 1000 }))
+	expect(readInflight(dir)).toBeNull() // stale markers don't block forever
+})

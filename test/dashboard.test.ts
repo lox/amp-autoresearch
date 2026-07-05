@@ -28,3 +28,15 @@ test('dashboard serves html, jsonl, sse, and 404', async () => {
 	expect(first).toContain('retry:')
 	await reader.cancel()
 })
+
+test('status endpoint reports in-flight state from the marker file', async () => {
+	const { startDashboard, inflightPath } = await import('../autoresearch')
+	dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ar-dash2-'))
+	fs.mkdirSync(path.join(dir, '.auto'))
+	const url = startDashboard(dir)
+	expect(await (await fetch(url + 'status')).json()).toEqual({ running: false, elapsedMs: null })
+	fs.writeFileSync(inflightPath(dir), JSON.stringify({ startedAt: Date.now() - 5000 }))
+	const s = (await (await fetch(url + 'status')).json()) as { running: boolean; elapsedMs: number }
+	expect(s.running).toBe(true)
+	expect(s.elapsedMs).toBeGreaterThanOrEqual(5000)
+})

@@ -316,6 +316,14 @@ export function formatRunLine(run: Run, baseline: number | null): string {
 		.join(' | ')
 }
 
+/**
+ * Probe runs are diagnostics/instrumentation (status discard, tagged
+ * asi.kind="probe") — measurements, not failed optimization attempts. The tag
+ * lives in ASI so pi-autoresearch tooling reads the log unchanged.
+ */
+export function isProbe(run: Run): boolean {
+	return run.status === 'discard' && run.asi?.kind === 'probe'
+}
 function bestMetric(runs: Run[], direction: BestDirection): number | null {
 	const kept = runs.filter((r) => r.status === 'keep').map((r) => r.metric)
 	if (!kept.length) return null
@@ -328,11 +336,16 @@ export function buildDigest(state: SessionState, opts: { recentRuns?: number } =
 	if (!runs.length)
 		return [header, 'runs: 0 — no experiments yet; take a baseline first.'].join('\n')
 	const counts: Record<RunStatus, number> = { keep: 0, discard: 0, crash: 0, checks_failed: 0 }
-	for (const r of runs) counts[r.status]++
+	let probes = 0
+	for (const r of runs) {
+		if (isProbe(r)) probes++
+		else counts[r.status]++
+	}
 	const baseline = findBaselineMetric(state.results, state.currentSegment)
 	const best = bestMetric(runs, state.bestDirection)
 	const confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection)
 	const countParts = [`${counts.keep} keep`, `${counts.discard} discard`, `${counts.crash} crash`]
+	if (probes) countParts.push(`${probes} probe`)
 	if (counts.checks_failed) countParts.push(`${counts.checks_failed} checks_failed`)
 	const conf = confidence === null ? '' : ` | confidence: ${confidence.toFixed(1)}×`
 	const recent = runs.slice(-(opts.recentRuns ?? 3))
@@ -377,6 +390,22 @@ export function configPath(workdir: string): string {
 }
 export function sessionFilePath(workdir: string): string {
 	return path.join(autoDir(workdir), 'amp-session.json')
+}
+export function inflightPath(workdir: string): string {
+	return path.join(autoDir(workdir), 'amp-inflight.json')
+}
+/** Max believable age for an in-flight marker (benchmark 600s + checks 300s + slack). */
+const INFLIGHT_STALE_MS = 30 * 60 * 1000
+/** Read the cross-process in-flight marker; null when absent or stale. */
+export function readInflight(workdir: string): { startedAt: number } | null {
+	try {
+		const parsed: unknown = JSON.parse(fs.readFileSync(inflightPath(workdir), 'utf-8'))
+		if (!isObjectRecord(parsed) || typeof parsed.startedAt !== 'number') return null
+		if (Date.now() - parsed.startedAt > INFLIGHT_STALE_MS) return null
+		return { startedAt: parsed.startedAt }
+	} catch {
+		return null
+	}
 }
 export function hookPath(workdir: string, hook: 'before' | 'after'): string {
 	return path.join(autoDir(workdir), 'hooks', `${hook}.sh`)
@@ -794,8 +823,9 @@ const LOOP_RULES = `## Loop Rules
 - **Simpler is better.** Removing code for equal perf = keep. Ugly complexity for tiny gain = probably discard.
 - **Don't thrash.** Repeatedly reverting the same idea? Try something structurally different.
 - **Crashes:** fix if trivial, otherwise log and move on.
+- **Diagnostics are probes, not failures.** When a run exists to gather attribution data (instrumentation, timing frames, re-measuring the current best) rather than to win, log it as discard with \`asi: {kind: "probe", ...}\` — probes are tallied separately and don't count as failed attempts.
 - **Think longer when stuck.** Re-read source, study the measurement output, reason about what the machine is actually doing.
-- **Stuck for 3+ discards in a row: consult the oracle** (if available) before trying more variations — give it the measurement data, your dead-end notes from \`.auto/log.jsonl\`, and the relevant source files, and ask where the metric is actually being spent.
+- **Stuck for 3+ failed optimization attempts in a row (probes don't count): consult the oracle** (if available) before trying more variations — give it the measurement data, your dead-end notes from \`.auto/log.jsonl\`, and the relevant source files, and ask where the metric is actually being spent.
 - **Ideas backlog:** append promising-but-deferred optimizations as bullets to \`.auto/ideas.md\`; prune stale entries on resume.
 - Be careful not to overfit to the benchmark and do not cheat on the benchmark.
 
@@ -816,7 +846,8 @@ export function buildCreateKickoff(goal: string, workdir: string): string {
 4. \`mkdir -p .auto\`, then write:
    - \`.auto/prompt.md\` — the session playbook (objective, metrics, how to run, files in scope, off limits, constraints, "what's been tried"). A fresh agent with no context must be able to run the loop from this file alone. Invest in it.
    - \`.auto/measure.sh\` — bash, \`set -euo pipefail\`, runs the benchmark and prints \`METRIC name=value\` lines (primary metric name must match init_experiment's metric_name). For fast noisy benchmarks (<5s), run several times inside the script and report the median.
-   - Add \`.auto/log.jsonl\` and \`.auto/amp-session.json\` to .gitignore.
+   - Add \`.auto/log.jsonl\`, \`.auto/amp-session.json\`, and \`.auto/amp-inflight.json\` to .gitignore.
+   - Write \`.auto/config.json\` with \`{"maxIterations": 30}\` unless the user's goal implies a different budget — an unattended loop should have a ceiling the user chose, not one they forgot.
    - Only if constraints require correctness validation, write \`.auto/checks.sh\` (runs after every passing benchmark; keep output minimal — errors only).
    Commit these files.
 5. Call \`init_experiment\` with working_dir set to the workspace root (${workdir}), plus name, metric_name, metric_unit, direction. Pick a unit that puts typical values in the 1–1000 range so dashboards and deltas stay readable: measure a ~0.014s benchmark as \`wall_ms\` ≈ 14, not \`wall_seconds\` ≈ 0.014.
@@ -848,6 +879,8 @@ interface DashboardServer {
 const dashboards = new Map<string, DashboardServer>()
 /** Notify interested parties (dashboard SSE, status item) after a logged run. */
 let onExperimentLogged: ((workdir: string) => void) | null = null
+/** Open a URL via the host (set in the default export; null in tests). */
+let openUrl: ((url: string) => Promise<void>) | null = null
 
 function dashboardHtml(sessionName: string): string {
 	// The plugin file may be symlinked into ~/.config/amp/plugins; resolve the
@@ -884,6 +917,13 @@ export function startDashboard(workdir: string): string {
 				const lp = logPath(workdir)
 				return new Response(fs.existsSync(lp) ? fs.readFileSync(lp, 'utf-8') : '', {
 					headers: { 'content-type': 'application/jsonl', 'cache-control': 'no-store' },
+				})
+			}
+			if (pathname === '/status') {
+				const running = readInflight(workdir)
+				return Response.json({
+					running: !!running,
+					elapsedMs: running ? Date.now() - running.startedAt : null,
 				})
 			}
 			if (pathname === '/events') {
@@ -1180,6 +1220,16 @@ export async function executeInit(input: Record<string, unknown>, ctx: ToolCtx):
 			appendHookLogEntryIfConfigured(workdir, 'before', h)
 			hookText = hookResultText('before', h) ?? ''
 		}
+		// Fresh activations auto-open the dashboard (resumes/rebinds stay quiet;
+		// headless runs have no browser to open).
+		if (!same && !resumed && openUrl && process.env.AMP_AUTORESEARCH_ASSUME_YES !== '1') {
+			try {
+				void openUrl(startDashboard(workdir)).catch(() => {})
+			} catch {}
+		}
+		try {
+			onExperimentLogged?.(workdir)
+		} catch {}
 		const cap = readMaxExperiments(workdir)
 		return [
 			`✅ Experiment ${resumed ? 'resumed' : 'initialized'}: "${name}"`,
@@ -1209,10 +1259,14 @@ export async function executeRun(input: Record<string, unknown>, ctx: ToolCtx): 
 		cap = readMaxExperiments(workdir),
 		segCount = currentResults(state.results, state.currentSegment).length
 	if (cap !== null && segCount >= cap) return `🛑 Maximum experiments reached (${cap}). Stop.`
-	const running = inflight.get(workdir)
+	const running = inflight.get(workdir) ?? readInflight(workdir)
 	if (running)
 		return `❌ Experiment already running, started ${Math.floor((Date.now() - running.startedAt) / 1000)}s ago.`
 	inflight.set(workdir, { startedAt: Date.now() })
+	try {
+		fs.mkdirSync(autoDir(workdir), { recursive: true })
+		fs.writeFileSync(inflightPath(workdir), JSON.stringify({ startedAt: Date.now() }))
+	} catch {}
 	try {
 		const h = await runHook({
 			event: 'before',
@@ -1317,6 +1371,9 @@ export async function executeRun(input: Record<string, unknown>, ctx: ToolCtx): 
 			.join('\n')
 	} finally {
 		inflight.delete(workdir)
+		try {
+			fs.rmSync(inflightPath(workdir), { force: true })
+		} catch {}
 	}
 }
 
@@ -1512,10 +1569,16 @@ export default function (amp: PluginAPI) {
 		}
 	})
 
+	openUrl = (url) => amp.system.open(url)
+
 	const agentStart = (event: { thread: { id: string }; message: string }) => {
 		const found = sessionForThread(event.thread.id)
 		if (!found) return {}
 		const { workdir, session } = found
+		// Repopulate the status item after plugin reloads (it hides until updated).
+		try {
+			onExperimentLogged?.(workdir)
+		} catch {}
 		// A genuine user message resets the auto-resume budget.
 		if (!isResumeMessage(event.message) && session.autoResumeTurns !== 0) {
 			try {
@@ -1720,8 +1783,38 @@ export default function (amp: PluginAPI) {
 				await ctx.ui.notify('Autoresearch: no active session for this thread.')
 				return
 			}
-			deactivateSession(found.workdir, { suppressFinalReview: true })
-			await ctx.ui.notify(`Autoresearch: session in ${found.workdir} stopped.`)
+			const { workdir, session } = found
+			// Deliberate stop with a UI available: offer the wrap-up instead of
+			// silently skipping it (interrupts still skip by design).
+			const lp = logPath(workdir)
+			const state = reconstructJsonlState(fs.existsSync(lp) ? fs.readFileSync(lp, 'utf-8') : '')
+			const kept = currentResults(state.results, state.currentSegment).filter(
+				(r) => r.status === 'keep',
+			)
+			if (kept.length > 0 && readFinalReview(workdir) && !session.finalReviewSent && ctx.thread) {
+				const review = await ctx.ui
+					.confirm({
+						title: 'Run the final review first?',
+						message: `Ask the oracle to re-validate the ${kept.length} kept experiment${kept.length > 1 ? 's' : ''} against their complexity before stopping?`,
+					})
+					.catch(() => false)
+				if (review) {
+					writeSessionFile(workdir, { ...session, active: false, finalReviewSent: true })
+					stopDashboard(workdir)
+					try {
+						await ctx.thread.appendUserMessage({
+							type: 'user-message',
+							content: buildFinalReviewMessage(state, workdir),
+						})
+						await ctx.ui.notify('Autoresearch: stopped — final review turn sent.')
+					} catch {
+						await ctx.ui.notify('Autoresearch: stopped, but the review message could not be sent.')
+					}
+					return
+				}
+			}
+			deactivateSession(workdir, { suppressFinalReview: true })
+			await ctx.ui.notify(`Autoresearch: session in ${workdir} stopped.`)
 		},
 	)
 
