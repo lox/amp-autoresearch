@@ -812,6 +812,104 @@ export function buildResumeKickoff(workdir: string): string {
 ${LOOP_RULES}`
 }
 
+// ── Dashboard server ──
+
+interface DashboardServer {
+	port: number
+	stop: () => void
+	broadcast: () => void
+}
+const dashboards = new Map<string, DashboardServer>()
+/** Notify interested parties (dashboard SSE, status item) after a logged run. */
+let onExperimentLogged: ((workdir: string) => void) | null = null
+
+function dashboardHtml(sessionName: string): string {
+	// The plugin file may be symlinked into ~/.config/amp/plugins; resolve the
+	// real path so the asset ships with the repo checkout.
+	try {
+		const here = path.dirname(fs.realpathSync(import.meta.path))
+		const html = fs.readFileSync(path.join(here, 'assets', 'dashboard.html'), 'utf-8')
+		return html.replaceAll('__AUTORESEARCH_TITLE__', sessionName)
+	} catch {
+		return `<!DOCTYPE html><meta charset="utf-8"><title>${sessionName}</title><body style="font-family:monospace;background:#0d1117;color:#c9d1d9;padding:2rem"><h1>${sessionName}</h1><p>Dashboard asset missing — showing raw log.</p><pre id="log"></pre><script>fetch('autoresearch.jsonl',{cache:'no-store'}).then(r=>r.text()).then(t=>{document.getElementById('log').textContent=t});new EventSource('/events').addEventListener('jsonl-updated',()=>location.reload())</script></body>`
+	}
+}
+
+/** Start (or reuse) the local dashboard server for a workdir. Returns its URL. */
+export function startDashboard(workdir: string): string {
+	const existing = dashboards.get(workdir)
+	if (existing) return `http://127.0.0.1:${existing.port}/`
+	const clients = new Set<ReadableStreamDefaultController>()
+	const server = Bun.serve({
+		hostname: '127.0.0.1',
+		port: 0,
+		fetch(req) {
+			const { pathname } = new URL(req.url)
+			if (pathname === '/') {
+				const lp = logPath(workdir)
+				const name = fs.existsSync(lp)
+					? extractSessionName(fs.readFileSync(lp, 'utf-8'))
+					: 'Autoresearch'
+				return new Response(dashboardHtml(name), {
+					headers: { 'content-type': 'text/html; charset=utf-8' },
+				})
+			}
+			if (pathname === '/autoresearch.jsonl') {
+				const lp = logPath(workdir)
+				return new Response(fs.existsSync(lp) ? fs.readFileSync(lp, 'utf-8') : '', {
+					headers: { 'content-type': 'application/jsonl', 'cache-control': 'no-store' },
+				})
+			}
+			if (pathname === '/events') {
+				let ctrl: ReadableStreamDefaultController
+				const stream = new ReadableStream({
+					start(c) {
+						ctrl = c
+						clients.add(c)
+						c.enqueue('retry: 1000\n\n')
+					},
+					cancel() {
+						clients.delete(ctrl)
+					},
+				})
+				return new Response(stream, {
+					headers: {
+						'content-type': 'text/event-stream',
+						'cache-control': 'no-cache',
+						connection: 'keep-alive',
+					},
+				})
+			}
+			return new Response('not found', { status: 404 })
+		},
+	})
+	const entry: DashboardServer = {
+		port: server.port ?? 0,
+		stop: () => {
+			for (const c of clients)
+				try {
+					c.close()
+				} catch {}
+			clients.clear()
+			server.stop(true)
+			dashboards.delete(workdir)
+		},
+		broadcast: () => {
+			for (const c of clients)
+				try {
+					c.enqueue(`event: jsonl-updated\ndata: ${Date.now()}\n\n`)
+				} catch {}
+		},
+	}
+	dashboards.set(workdir, entry)
+	return `http://127.0.0.1:${entry.port}/`
+}
+
+/** Stop the dashboard server for a workdir, if running. */
+export function stopDashboard(workdir: string): void {
+	dashboards.get(workdir)?.stop()
+}
+
 // ── Loop decisions ──
 
 export interface ContinueDecision {
@@ -856,10 +954,11 @@ export function turnLoggedExperiment(
 	return toolCalls.some((tc) => tc.call.tool === 'log_experiment' && tc.result.status === 'done')
 }
 
-/** Mark a session inactive on disk. */
+/** Mark a session inactive on disk and tear down its dashboard. */
 export function deactivateSession(workdir: string): void {
 	const s = readSessionFile(workdir)
 	if (s?.active) writeSessionFile(workdir, { ...s, active: false })
+	stopDashboard(workdir)
 }
 
 // ── Tool execute functions ──
@@ -1176,6 +1275,10 @@ export async function executeLog(input: Record<string, unknown>, ctx: ToolCtx): 
 		}
 		fs.mkdirSync(autoDir(workdir), { recursive: true })
 		fs.appendFileSync(logPath(workdir), JSON.stringify(entry) + '\n')
+		dashboards.get(workdir)?.broadcast()
+		try {
+			onExperimentLogged?.(workdir)
+		} catch {}
 		if (status !== 'keep') {
 			await gitRevertAll(workdir)
 			gitLine = `📝 Git: reverted changes (${status}) — .auto/ preserved`
@@ -1474,6 +1577,64 @@ export default function (amp: PluginAPI) {
 			await ctx.ui.notify('Autoresearch: log cleared, session deactivated.')
 		},
 	)
+
+	amp.registerCommand(
+		'autoresearch-dashboard',
+		{
+			title: 'Dashboard',
+			category: 'Autoresearch',
+			description: 'Open the live browser dashboard for the current thread’s session',
+		},
+		async (ctx) => {
+			const found = ctx.thread && sessionForThread(ctx.thread.id)
+			if (!found) {
+				await ctx.ui.notify('Autoresearch: no active session for this thread.')
+				return
+			}
+			try {
+				const url = startDashboard(found.workdir)
+				await ctx.system.open(url)
+			} catch (e) {
+				amp.logger.log(`autoresearch-dashboard failed: ${e}`)
+				await ctx.ui.notify(`Autoresearch: could not open dashboard: ${e}`)
+			}
+		},
+	)
+
+	// ── Status item (experimental API; absent hosts degrade to nothing) ──
+
+	try {
+		const statusItem = amp.experimental?.createStatusItem?.()
+		if (statusItem) {
+			onExperimentLogged = (workdir) => {
+				const lp = logPath(workdir)
+				if (!fs.existsSync(lp)) return
+				const state = reconstructJsonlState(fs.readFileSync(lp, 'utf-8'))
+				const runs = currentResults(state.results, state.currentSegment)
+				const best = bestMetric(runs, state.bestDirection)
+				const baseline = findBaselineMetric(state.results, state.currentSegment)
+				const confidence = computeConfidence(
+					state.results,
+					state.currentSegment,
+					state.bestDirection,
+				)
+				statusItem.update({
+					text: [
+						`🔬 ${runs.length} runs`,
+						best !== null
+							? `best ${formatNum(best, state.metricUnit)}${formatDelta(best, baseline)}`
+							: '',
+						confidence !== null ? `conf ${confidence.toFixed(1)}×` : '',
+					]
+						.filter(Boolean)
+						.join(' · '),
+					url: 'command:autoresearch-dashboard',
+				})
+			}
+		}
+	} catch (e) {
+		amp.logger.log(`autoresearch: status item unavailable: ${e}`)
+	}
 
 	amp.registerCommand(
 		'autoresearch-status',
