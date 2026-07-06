@@ -81,6 +81,22 @@ AMP_AUTORESEARCH_ASSUME_YES=1 amp -x "Set up and run an autoresearch loop: <goal
 
 Raise `maxAutoResumeTurns` (below) for long unattended runs.
 
+## Finalizing a session
+
+The experiment branch is a log, not a reviewable history. The bundled
+**autoresearch-finalize** skill turns the kept experiments into independent review
+branches — one clean, reviewer-facing commit each, cut from the merge-base so they
+merge in any order. It reads the end-of-session oracle review verdicts from
+`.auto/ideas.md` and proposes a grouping for your approval before touching anything.
+
+Skills install separately from plugins:
+
+```sh
+amp skill add https://github.com/lox/amp-autoresearch
+```
+
+Then ask the agent to "finalize the autoresearch session" on the experiment branch.
+
 ## Session files (`.auto/`)
 
 Byte-compatible with pi-autoresearch (current layout; no legacy flat files).
