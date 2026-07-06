@@ -20,7 +20,7 @@ edit code → run_experiment → log_experiment → keep or revert → repeat
 
 ```sh
 git clone <this repo> && cd amp-autoresearch
-mise run install    # symlinks autoresearch.ts into ~/.config/amp/plugins/
+mise run install    # installs into ~/.config/amp/plugins/
 ```
 
 Restart Amp (or `plugins: reload` from the command palette), open a thread, then run
@@ -29,8 +29,9 @@ one-sentence goal, and the agent does the rest: creates a branch, writes the ses
 playbook and benchmark script, takes a baseline, and starts looping. Fresh sessions
 open the browser dashboard automatically.
 
-Install by symlink, not copy — the dashboard asset (`assets/dashboard.html`) resolves
-through the symlink back to this checkout.
+The installer prefers a symlink back to this checkout. On systems where file symlinks
+are unavailable (notably some Windows setups), it writes a tiny import shim instead;
+either way the dashboard asset (`assets/dashboard.html`) resolves from this checkout.
 
 ## Watching it run
 

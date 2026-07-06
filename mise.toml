@@ -15,15 +15,12 @@ depends = ["test", "typecheck"]
 
 [tasks.fmt]
 description = "Format with prettier"
-run = "bun x prettier --write autoresearch.ts test/*.ts"
+run = "bun x prettier --write autoresearch.ts scripts/*.ts test/*.ts"
 
 [tasks.install]
-description = "Symlink the plugin into ~/.config/amp/plugins"
-run = [
-  "mkdir -p ~/.config/amp/plugins",
-  "ln -sf {{config_root}}/autoresearch.ts ~/.config/amp/plugins/amp-autoresearch.ts",
-]
+description = "Install the plugin into ~/.config/amp/plugins"
+run = "bun run scripts/plugin-install.ts"
 
 [tasks.uninstall]
-description = "Remove the plugin symlink"
-run = "rm -f ~/.config/amp/plugins/amp-autoresearch.ts"
+description = "Remove the installed plugin"
+run = "bun run scripts/plugin-install.ts uninstall"
