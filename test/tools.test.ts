@@ -220,3 +220,62 @@ test('stale binding after takeover refuses run/log (ownership re-validation)', a
 		await executeLog({ commit: 'abc1234', metric: 1, status: 'discard', description: 'x' }, ctx),
 	).toContain('no longer holds')
 })
+
+test('probe metrics are ephemeral: no force-dance around instrumentation fields', async () => {
+	const { executeInit, executeLog, establishedSecondaryMetrics, reconstructJsonlState, logPath } =
+		await import('../autoresearch')
+	const dir = repo()
+	execFileSync('git', ['checkout', '-b', 'autoresearch/test'], { cwd: dir })
+	const yes = { ...ctx, ui: { confirm: async () => true } }
+	await executeInit({ working_dir: dir, name: 'T', metric_name: 'ms' }, yes)
+	// Baseline establishes one secondary metric.
+	expect(
+		await executeLog(
+			{
+				commit: 'aaaaaaa',
+				metric: 100,
+				status: 'keep',
+				description: 'base',
+				metrics: { p95: 120 },
+			},
+			ctx,
+		),
+	).toContain('✅ kept')
+	// A probe reports extra instrumentation fields — no force needed, and it
+	// doesn't have to include the established p95 either.
+	expect(
+		await executeLog(
+			{
+				commit: 'bbbbbbb',
+				metric: 100,
+				status: 'discard',
+				description: 'instrumented re-measure',
+				metrics: { backend_run_ms: 31, tail_ms: 2 },
+				asi: { kind: 'probe', learned: 'attribution' },
+			},
+			ctx,
+		),
+	).toContain('discarded')
+	// The probe's fields did NOT join the tracked set...
+	const state = reconstructJsonlState(fs.readFileSync(logPath(dir), 'utf-8'))
+	expect(establishedSecondaryMetrics(state).sort()).toEqual(['p95'])
+	// ...so the next normal run only owes p95 (no force), and still gets
+	// refused if it drops the genuinely tracked metric.
+	expect(
+		await executeLog(
+			{ commit: 'ccccccc', metric: 90, status: 'keep', description: 'win', metrics: { p95: 110 } },
+			ctx,
+		),
+	).toContain('✅ kept')
+	expect(
+		await executeLog(
+			{ commit: 'ddddddd', metric: 85, status: 'keep', description: 'drop', metrics: {} },
+			ctx,
+		),
+	).toContain('Missing secondary metrics: p95')
+})
+
+test('first tracked run defines the secondary-metric set without force', async () => {
+	const { checkSecondaryMetrics } = await import('../autoresearch')
+	expect(checkSecondaryMetrics([], { p95: 1, mem_kb: 2 })).toEqual({ ok: true })
+})

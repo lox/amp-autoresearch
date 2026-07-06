@@ -324,6 +324,17 @@ export function formatRunLine(run: Run, baseline: number | null): string {
 export function isProbe(run: Run): boolean {
 	return run.status === 'discard' && run.asi?.kind === 'probe'
 }
+/**
+ * Secondary metrics the session is committed to tracking: those reported by
+ * non-probe runs in the current segment. Probe runs carry ephemeral
+ * instrumentation fields that must not become obligations for every later run.
+ */
+export function establishedSecondaryMetrics(state: SessionState): string[] {
+	const names = new Set<string>()
+	for (const r of currentResults(state.results, state.currentSegment))
+		if (!isProbe(r)) for (const name of Object.keys(r.metrics)) names.add(name)
+	return [...names]
+}
 function bestMetric(runs: Run[], direction: BestDirection): number | null {
 	const kept = runs.filter((r) => r.status === 'keep').map((r) => r.metric)
 	if (!kept.length) return null
@@ -799,6 +810,8 @@ export function checkSecondaryMetrics(
 	provided: Record<string, number> | undefined,
 	force = false,
 ): { ok: true } | { error: string } {
+	// No commitments yet: the first tracked run defines the set freely (pi parity).
+	if (established.length === 0) return { ok: true }
 	const p = new Set(Object.keys(provided ?? {}))
 	const missing = established.filter((n) => !p.has(n))
 	if (missing.length) return { error: `Missing secondary metrics: ${missing.join(', ')}` }
@@ -834,7 +847,7 @@ const LOOP_RULES = `## Loop Rules
 - **Simpler is better.** Removing code for equal perf = keep. Ugly complexity for tiny gain = probably discard.
 - **Don't thrash.** Repeatedly reverting the same idea? Try something structurally different.
 - **Crashes:** fix if trivial, otherwise log and move on.
-- **Diagnostics are probes, not failures.** When a run exists to gather attribution data (instrumentation, timing frames, re-measuring the current best) rather than to win, log it as discard with \`asi: {kind: "probe", ...}\` — probes are tallied separately and don't count as failed attempts.
+- **Diagnostics are probes, not failures.** When a run exists to gather attribution data (instrumentation, timing frames, re-measuring the current best) rather than to win, log it as discard with \`asi: {kind: "probe", ...}\` — probes are tallied separately, don't count as failed attempts, and may report any metrics without joining (or having to satisfy) the tracked secondary-metric set.
 - **Think longer when stuck.** Re-read source, study the measurement output, reason about what the machine is actually doing.
 - **Stuck for 3+ failed optimization attempts in a row (probes don't count): consult the oracle** (if available) before trying more variations — give it the measurement data, your dead-end notes from \`.auto/log.jsonl\`, and the relevant source files, and ask where the metric is actually being spent.
 - **Ideas backlog:** append promising-but-deferred optimizations as bullets to \`.auto/ideas.md\`; prune stale entries on resume.
@@ -1418,12 +1431,18 @@ export async function executeLog(input: Record<string, unknown>, ctx: ToolCtx): 
 			return '❌ metric must be a finite number (use 0 for crashes).'
 		if (status === 'keep' && rt.lastRunChecks && !rt.lastRunChecks.pass)
 			return `❌ Cannot keep — .auto/checks.sh failed.\n\n${rt.lastRunChecks.output.slice(-500)}\n\nLog as 'checks_failed' instead.`
-		const chk = checkSecondaryMetrics(
-			state.secondaryMetrics.map((m) => m.name),
-			metrics,
-			input.force === true,
-		)
-		if ('error' in chk) return `❌ ${chk.error}`
+		// Probe runs are free-form diagnostics: they neither join the tracked
+		// secondary-metric set nor have to satisfy it.
+		const incomingProbe =
+			status === 'discard' && isObjectRecord(input.asi) && input.asi.kind === 'probe'
+		if (!incomingProbe) {
+			const chk = checkSecondaryMetrics(
+				establishedSecondaryMetrics(state),
+				metrics,
+				input.force === true,
+			)
+			if ('error' in chk) return `❌ ${chk.error}`
+		}
 		const beforeBest = bestMetric(
 			currentResults(state.results, state.currentSegment),
 			state.bestDirection,
