@@ -185,6 +185,3 @@ mise run test
 mise run typecheck
 mise run fmt        # prettier
 ```
-
-Design/plan (including three rounds of adversarial-review findings):
-[docs/plans/amp-autoresearch.md](docs/plans/amp-autoresearch.md).
