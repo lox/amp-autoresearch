@@ -138,7 +138,8 @@ Verified against `amp plugins show-docs` (current version):
   to v2; requires pinning a model and shipping mode metadata comments.
 - **Terminal fullscreen dashboard / keyboard shortcuts** — no Amp API for either.
 - **Streaming benchmark output during a run** — no partial tool output API.
-- **npm packaging/distribution** — install is copy/symlink into `~/.config/amp/plugins/`.
+- **npm packaging/distribution** — install is into `~/.config/amp/plugins/` by symlink
+  or generated import shim.
 
 ## Target model
 
@@ -448,7 +449,8 @@ amp-autoresearch/
 │   ├── jsonl.test.ts        # state reconstruction (pure)
 │   ├── confidence.test.ts   # MAD scoring (pure)
 │   └── fixtures/
-├── mise.toml                # tasks: install (symlink), test, typecheck, check, fmt
+├── scripts/plugin-install.ts # cross-platform plugin installer
+├── mise.toml                # tasks: install, uninstall, test, typecheck, check, fmt
 └── README.md
 ```
 
@@ -502,10 +504,9 @@ tool `execute` (needed for orphaned-benchmark reaping).
 
 ### Slice 1 — Scaffold + state core
 
-Repo scaffold, mise tasks (symlink install), and the pure core: jsonl
-parse/reconstruct (port of pi's `jsonl.ts`), confidence scoring, `METRIC` line parser,
-digest renderer, `.auto/` path helpers, `amp-session.json` read/write. Unit tests for
-all of it.
+Repo scaffold, mise install/uninstall tasks, and the pure core: jsonl parse/reconstruct
+(port of pi's `jsonl.ts`), confidence scoring, `METRIC` line parser, digest renderer,
+`.auto/` path helpers, `amp-session.json` read/write. Unit tests for all of it.
 
 **Done when:** `bun test` green; fixtures include a real pi-generated `log.jsonl`.
 
@@ -577,8 +578,9 @@ latency for in-flight benchmarks); final oracle code review.
 
 ## Resolved decisions
 
-- Repo at `~/Develop/lox/amp-autoresearch`, installed by symlink into
-  `~/.config/amp/plugins/`. System-wide plugin (not per-project).
+- Repo at `~/Develop/lox/amp-autoresearch`, installed into `~/.config/amp/plugins/`
+  by symlink when available, otherwise a generated import shim. System-wide plugin
+  (not per-project).
 - pi-compatible `.auto/` layout, current format only; no legacy flat-file support.
 - Required `working_dir` parameter on `init_experiment`; no `process.cwd()` anywhere.
 - Tools gate on initialized session, not a mode flag; mode concept exists only for
