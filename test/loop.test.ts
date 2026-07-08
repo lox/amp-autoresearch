@@ -203,6 +203,16 @@ test('kickoff includes probe convention and default iteration budget', async () 
 	expect(k).toContain('amp-inflight.json')
 })
 
+test('kickoff requires fresh builds in measure.sh and profiling before optimizing', async () => {
+	const { buildCreateKickoff, buildResumeKickoff } = await import('../autoresearch')
+	const create = buildCreateKickoff('goal', '/repo')
+	expect(create).toContain('It must build the code under test itself')
+	expect(create).toContain('never benchmark a stale build')
+	expect(create).toContain('Profile before optimizing.')
+	// The loop rules (including profile-before-optimizing) ship with resume kickoffs too.
+	expect(buildResumeKickoff('/repo')).toContain('Profile before optimizing.')
+})
+
 test('inflight marker readable, stale-guarded, and cleared by run_experiment', async () => {
 	const fsMod = await import('node:fs')
 	const osMod = await import('node:os')

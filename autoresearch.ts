@@ -848,6 +848,7 @@ const LOOP_RULES = `## Loop Rules
 - **Don't thrash.** Repeatedly reverting the same idea? Try something structurally different.
 - **Crashes:** fix if trivial, otherwise log and move on.
 - **Diagnostics are probes, not failures.** When a run exists to gather attribution data (instrumentation, timing frames, re-measuring the current best) rather than to win, log it as discard with \`asi: {kind: "probe", ...}\` — probes are tallied separately, don't count as failed attempts, and may report any metrics without joining (or having to satisfy) the tracked secondary-metric set.
+- **Profile before optimizing.** Before your first optimization attempt — and again whenever the bottleneck is unproven — run a probe (instrumentation, subphase timings, a profiler) to locate where the metric is actually spent. Optimize the measured hotspot, not the hypothesized one; a plausible-sounding theory about where time goes is the most expensive way to burn iterations.
 - **Think longer when stuck.** Re-read source, study the measurement output, reason about what the machine is actually doing.
 - **Stuck for 3+ failed optimization attempts in a row (probes don't count): consult the oracle** (if available) before trying more variations — give it the measurement data, your dead-end notes from \`.auto/log.jsonl\`, and the relevant source files, and ask where the metric is actually being spent.
 - **Ideas backlog:** append promising-but-deferred optimizations as bullets to \`.auto/ideas.md\`; prune stale entries on resume.
@@ -869,7 +870,7 @@ export function buildCreateKickoff(goal: string, workdir: string): string {
 3. Read the source files. Understand the workload deeply before writing anything.
 4. \`mkdir -p .auto\`, then write:
    - \`.auto/prompt.md\` — the session playbook (objective, metrics, how to run, files in scope, off limits, constraints, "what's been tried"). A fresh agent with no context must be able to run the loop from this file alone. Invest in it.
-   - \`.auto/measure.sh\` — bash, \`set -euo pipefail\`, runs the benchmark and prints \`METRIC name=value\` lines (primary metric name must match init_experiment's metric_name). For fast noisy benchmarks (<5s), run several times inside the script and report the median.
+   - \`.auto/measure.sh\` — bash, \`set -euo pipefail\`, runs the benchmark and prints \`METRIC name=value\` lines (primary metric name must match init_experiment's metric_name). For fast noisy benchmarks (<5s), run several times inside the script and report the median. **It must build the code under test itself** (or verify the benchmarked artifact is newer than the source tree) — never benchmark a stale build; a \`--no-build\` flag on the benchmark without a preceding build step silently measures the pre-edit binary.
    - Add \`.auto/log.jsonl\`, \`.auto/amp-session.json\`, and \`.auto/amp-inflight.json\` to .gitignore.
    - Write \`.auto/config.json\` with \`{"maxIterations": 30}\` unless the user's goal implies a different budget — an unattended loop should have a ceiling the user chose, not one they forgot.
    - Only if constraints require correctness validation, write \`.auto/checks.sh\` (runs after every passing benchmark; keep output minimal — errors only).
