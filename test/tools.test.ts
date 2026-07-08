@@ -279,3 +279,56 @@ test('first tracked run defines the secondary-metric set without force', async (
 	const { checkSecondaryMetrics } = await import('../autoresearch')
 	expect(checkSecondaryMetrics([], { p95: 1, mem_kb: 2 })).toEqual({ ok: true })
 })
+
+test('conclude_experiment refuses unbound, checks ownership, claims the final review once', async () => {
+	const { executeConclude, writeSessionFile, readSessionFile, logPath } =
+		await import('../autoresearch')
+	expect(await executeConclude({ reason: 'done' }, ctx)).toContain('No experiment session')
+	const dir = repo()
+	bindThreadSession('T-test', dir)
+	expect(await executeConclude({ reason: 'done' }, ctx)).toContain('no longer holds')
+	writeSessionFile(dir, {
+		version: 1,
+		threadID: 'T-test',
+		workdir: dir,
+		active: true,
+		autoResumeTurns: 0,
+		activatedAt: Date.now(),
+	})
+	fs.writeFileSync(
+		logPath(dir),
+		'{"type":"config","name":"S","metricName":"ms","metricUnit":"ms","bestDirection":"lower"}\n' +
+			'{"run":1,"commit":"abc1234","metric":100,"metrics":{},"status":"keep","description":"baseline","timestamp":1,"confidence":null}\n',
+	)
+	const out = await executeConclude({ reason: 'target met' }, ctx)
+	expect(out).toContain('Session concluded — target met')
+	expect(out).toContain('pressure-test the kept experiments with the oracle')
+	const after = readSessionFile(dir)!
+	expect(after.active).toBe(false)
+	expect(after.finalReviewSent).toBe(true)
+	// Second conclude is idempotent: no double-send, no rebind suggestion.
+	const again = await executeConclude({ reason: 'again' }, ctx)
+	expect(again).toContain('Session already concluded')
+	expect(again).not.toContain('init_experiment')
+})
+
+test('conclude_experiment deactivates cleanly when there is nothing to review', async () => {
+	const { executeConclude, writeSessionFile, readSessionFile } = await import('../autoresearch')
+	const dir = repo()
+	bindThreadSession('T-test', dir)
+	writeSessionFile(dir, {
+		version: 1,
+		threadID: 'T-test',
+		workdir: dir,
+		active: true,
+		autoResumeTurns: 0,
+		activatedAt: Date.now(),
+	})
+	// No .auto/log.jsonl → no kept experiments → no review, but a clean stop.
+	const out = await executeConclude({ reason: 'ideas exhausted' }, ctx)
+	expect(out).toContain('Session concluded — ideas exhausted')
+	expect(out).toContain('No kept experiments to review')
+	const after = readSessionFile(dir)!
+	expect(after.active).toBe(false)
+	expect(after.finalReviewSent).toBe(true)
+})

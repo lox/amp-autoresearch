@@ -849,12 +849,13 @@ const LOOP_RULES = `## Loop Rules
 - **Crashes:** fix if trivial, otherwise log and move on.
 - **Diagnostics are probes, not failures.** When a run exists to gather attribution data (instrumentation, timing frames, re-measuring the current best) rather than to win, log it as discard with \`asi: {kind: "probe", ...}\` — probes are tallied separately, don't count as failed attempts, and may report any metrics without joining (or having to satisfy) the tracked secondary-metric set.
 - **Profile before optimizing.** Before your first optimization attempt — and again whenever the bottleneck is unproven — run a probe (instrumentation, subphase timings, a profiler) to locate where the metric is actually spent. Optimize the measured hotspot, not the hypothesized one; a plausible-sounding theory about where time goes is the most expensive way to burn iterations.
+- **Checkpoint pressure-test every ~5 keeps.** Roughly every 5 kept experiments, consult the oracle (if available) with the kept diffs so far and ask what the metric and checks structurally cannot catch: what breaks on inputs the benchmark never ran, what allocates proportional to input size, which invariants are assumed but not asserted, and which wins aren't worth their complexity. Log the checkpoint as a probe with \`asi: {kind: "review", ...}\` and record actionable verdicts in \`.auto/ideas.md\`.
 - **Think longer when stuck.** Re-read source, study the measurement output, reason about what the machine is actually doing.
 - **Stuck for 3+ failed optimization attempts in a row (probes don't count): consult the oracle** (if available) before trying more variations — give it the measurement data, your dead-end notes from \`.auto/log.jsonl\`, and the relevant source files, and ask where the metric is actually being spent.
 - **Ideas backlog:** append promising-but-deferred optimizations as bullets to \`.auto/ideas.md\`; prune stale entries on resume.
 - Be careful not to overfit to the benchmark and do not cheat on the benchmark.
 
-**NEVER STOP.** The user may be away for hours. Keep going until interrupted.`
+**NEVER STOP SILENTLY.** The user may be away for hours. Keep going until interrupted, capped, or genuinely done. If you believe the session is complete (target met and remaining ideas are marginal, or ideas exhausted), do not write a wrap-up on your own: call \`conclude_experiment\` with your reason — it returns the mandatory final pressure-test to run before your wrap-up.`
 
 /** Kickoff message for a brand-new session (no .auto/prompt.md yet). */
 export function buildCreateKickoff(goal: string, workdir: string): string {
@@ -1061,19 +1062,28 @@ export function buildFinalReviewMessage(state: SessionState, workdir: string): s
 	return [
 		'The autoresearch session has ended. Do NOT run more experiments.',
 		'',
-		'Final step: consult the oracle to re-validate the kept experiments. Give it the',
-		`kept commits below, the run log (${logPath(workdir)}), the diffs of each kept`,
-		'commit, and the session rules (.auto/prompt.md). Ask it, for each kept change:',
-		'is the measured win worth the added complexity, and did any secondary metric',
-		'or benchmark-shape assumption quietly regress?',
+		'Final step: pressure-test the kept experiments with the oracle. Give it the kept',
+		`commits below with their full diffs, the run log (${logPath(workdir)}), and the`,
+		'session constraints (.auto/prompt.md). The benchmark only ever measured a narrow',
+		'set of inputs, so ask specifically for what the metric and checks structurally',
+		'cannot catch:',
+		'',
+		'- **Correctness beyond the benchmark.** What breaks on inputs the loop never ran',
+		'  — edge cases, boundary sizes, empty or degenerate inputs, larger scales?',
+		'- **Resource scaling.** Does any kept change allocate memory or do work',
+		'  proportional to input size in a way the benchmark input was too small to expose?',
+		'- **Unasserted invariants.** What does each change assume but not assert or test?',
+		'  Name the smallest guard or test that would encode it.',
+		'- **Complexity vs win.** Is each measured gain worth its diff? Flag marginal wins',
+		'  riding along with big ones.',
 		'',
 		'Kept experiments:',
 		...keptLines,
 		'',
-		'Then report: which commits to keep as-is, which to simplify or squash, and',
-		'which to revert as not worth their complexity. Append the verdicts to',
-		'.auto/ideas.md under a "Final review" heading. Do not revert anything without',
-		'asking the user first.',
+		'Ask for a per-commit verdict — keep as-is, simplify, or revert — each with a',
+		'one-line reason and the smallest fix, plus an overall ship/no-ship for the set.',
+		'Append the verdicts to .auto/ideas.md under a "Final review" heading (the',
+		'finalize skill reads them). Do not revert anything without asking the user first.',
 	].join('\n')
 }
 
@@ -1533,6 +1543,42 @@ export async function executeLog(input: Record<string, unknown>, ctx: ToolCtx): 
 	}
 }
 
+/**
+ * Deliberate agent-initiated session end: the sanctioned alternative to a
+ * silent wrap-up. Claims the one-shot final review so the pressure test runs
+ * in the same turn (and agent.end cannot double-send it), then deactivates.
+ */
+export async function executeConclude(
+	input: Record<string, unknown>,
+	ctx: ToolCtx,
+): Promise<string> {
+	try {
+		const rt = runtimeForThread(ctx.thread.id)
+		if (!rt) return unbound
+		const workdir = rt.workdir
+		const session = readSessionFile(workdir)
+		if (!session || session.threadID !== ctx.thread.id)
+			return ownershipError(ctx.thread.id, workdir)!
+		// Idempotent for the owning thread: a repeat call after concluding must
+		// not suggest rebinding (init_experiment) or the agent may restart the loop.
+		if (!session.active)
+			return '✅ Session already concluded. Finish the final review if it is still pending, then write your wrap-up.'
+		const reason = String(input.reason ?? '').trim() || 'no reason given'
+		const review = claimFinalReview(workdir, session)
+		if (!review) {
+			deactivateSession(workdir, { suppressFinalReview: true })
+			return `✅ Session concluded — ${reason}. No kept experiments to review; write your wrap-up.`
+		}
+		return [
+			`✅ Session concluded — ${reason}. One mandatory step remains before your wrap-up:`,
+			'',
+			review,
+		].join('\n')
+	} catch (e) {
+		return `❌ conclude_experiment failed: ${e instanceof Error ? e.message : String(e)}`
+	}
+}
+
 export default function (amp: PluginAPI) {
 	amp.registerTool({
 		name: 'init_experiment',
@@ -1590,6 +1636,23 @@ export default function (amp: PluginAPI) {
 			required: ['commit', 'metric', 'status', 'description'],
 		},
 		execute: executeLog,
+	})
+	amp.registerTool({
+		name: 'conclude_experiment',
+		description:
+			'Deliberately end the autoresearch session (target met, ideas exhausted). Returns the mandatory final pressure-test instructions — complete them before writing your wrap-up.',
+		inputSchema: {
+			type: 'object',
+			properties: {
+				reason: {
+					type: 'string',
+					description:
+						'Why the session is complete, e.g. "target of 4x met; remaining ideas are marginal"',
+				},
+			},
+			required: ['reason'],
+		},
+		execute: executeConclude,
 	})
 
 	const notify = async (ctx: { ui: { notify: (m: string) => Promise<void> } }, message: string) => {

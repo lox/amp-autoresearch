@@ -35,10 +35,10 @@ either way the dashboard asset (`assets/dashboard.html`) resolves from this chec
 
 ## Watching it run
 
-| Surface | What you get |
-|---|---|
-| Thread | A scoreboard after every experiment: metric, delta vs baseline/best, verdict, confidence, recent runs. |
-| Status bar | One line, always current: `🔬 23 runs · best 13.5ms (−37%) · conf 26.8×`. Click it for the dashboard. |
+| Surface           | What you get                                                                                                                                                                                                         |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Thread            | A scoreboard after every experiment: metric, delta vs baseline/best, verdict, confidence, recent runs.                                                                                                               |
+| Status bar        | One line, always current: `🔬 23 runs · best 13.5ms (−37%) · conf 26.8×`. Click it for the dashboard.                                                                                                                |
 | Browser dashboard | The screenshot above: live metric trace with baseline/best reference lines, stat cards, and an expandable run log with the agent's per-run notes. Updates over SSE as runs land. `Autoresearch: Dashboard` opens it. |
 
 Every run carries **ASI** ("actionable side information") — the agent's notes on what
@@ -52,24 +52,29 @@ Diagnostic runs (instrumentation, noise re-measurements) are tagged
 
 ## Commands
 
-| Command | Does |
-|---|---|
-| `Autoresearch: Start` | Start a new session, or resume when `.auto/prompt.md` exists. |
-| `Autoresearch: Stop` | Deactivate the session — offers to run the final oracle review of kept experiments first. |
-| `Autoresearch: Status` | One-glance digest: runs, baseline, best, confidence. |
-| `Autoresearch: Dashboard` | Open the live browser dashboard. |
-| `Autoresearch: Clear log` | Delete `.auto/log.jsonl` and deactivate. Kept commits stay in git. |
+| Command                   | Does                                                                                      |
+| ------------------------- | ----------------------------------------------------------------------------------------- |
+| `Autoresearch: Start`     | Start a new session, or resume when `.auto/prompt.md` exists.                             |
+| `Autoresearch: Stop`      | Deactivate the session — offers to run the final oracle review of kept experiments first. |
+| `Autoresearch: Status`    | One-glance digest: runs, baseline, best, confidence.                                      |
+| `Autoresearch: Dashboard` | Open the live browser dashboard.                                                          |
+| `Autoresearch: Clear log` | Delete `.auto/log.jsonl` and deactivate. Kept commits stay in git.                        |
 
 After any turn that logged an experiment, the plugin automatically prompts the next
 iteration — capped at 20 auto-resumes by default; any real message from you resets the
-cap. The agent stops cleanly at `maxIterations`, on `Stop`, or when you interrupt.
+cap. The agent stops cleanly at `maxIterations`, on `Stop`, when you interrupt, or by
+calling `conclude_experiment` when it judges the session complete — it must never
+wrap up silently.
 
-When a session ends on its own (`maxIterations` or the resume cap) with kept
-experiments, the plugin sends **one final review turn**: the agent takes the kept
-commits, their diffs, and the run log to the oracle and re-validates each win against
-its complexity cost — keep, simplify, or recommend reverting (it never reverts without
-asking). Verdicts land in `.auto/ideas.md`. Explicit `Stop`/`Clear` skip it; disable
-with `"finalReview": false` in `.auto/config.json`.
+When a session ends with kept experiments — `maxIterations`, the resume cap, or
+`conclude_experiment` — the plugin sends **one final pressure-test turn**: the agent
+takes the kept commits, their diffs, and the run log to the oracle and asks for what
+the benchmark structurally cannot catch — correctness on inputs the loop never ran,
+resource scaling, unasserted invariants, and marginal wins riding on big ones — plus a
+per-commit keep/simplify/revert verdict (it never reverts without asking). Verdicts
+land in `.auto/ideas.md`. Explicit `Stop`/`Clear` skip it; disable with
+`"finalReview": false` in `.auto/config.json`. The loop rules also prompt a lighter
+checkpoint pressure-test roughly every 5 kept experiments, logged as a probe.
 
 ### Headless / overnight runs
 
@@ -102,16 +107,16 @@ Then ask the agent to "finalize the autoresearch session" on the experiment bran
 
 Byte-compatible with pi-autoresearch (current layout; no legacy flat files).
 
-| File | Purpose |
-|---|---|
-| `prompt.md` | Session playbook — objective, metrics, files in scope, constraints, what's been tried |
-| `measure.sh` | Benchmark script; prints `METRIC name=value` lines |
-| `log.jsonl` | Append-only run log (source of truth; written by the tools) |
-| `checks.sh` | Optional correctness backpressure — runs after every passing benchmark; failing checks block `keep` |
-| `ideas.md` | Optional ideas backlog |
-| `config.json` | Optional session config (below) |
-| `hooks/before.sh`, `hooks/after.sh` | Optional lifecycle hooks: JSON payload on stdin, stdout is fed back to the agent |
-| `amp-session.json` | Amp-only: session/lock record binding the workdir to one thread |
+| File                                | Purpose                                                                                             |
+| ----------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `prompt.md`                         | Session playbook — objective, metrics, files in scope, constraints, what's been tried               |
+| `measure.sh`                        | Benchmark script; prints `METRIC name=value` lines                                                  |
+| `log.jsonl`                         | Append-only run log (source of truth; written by the tools)                                         |
+| `checks.sh`                         | Optional correctness backpressure — runs after every passing benchmark; failing checks block `keep` |
+| `ideas.md`                          | Optional ideas backlog                                                                              |
+| `config.json`                       | Optional session config (below)                                                                     |
+| `hooks/before.sh`, `hooks/after.sh` | Optional lifecycle hooks: JSON payload on stdin, stdout is fed back to the agent                    |
+| `amp-session.json`                  | Amp-only: session/lock record binding the workdir to one thread                                     |
 
 Gitignore `log.jsonl` and `amp-session.json` (the kickoff prompt instructs the agent
 to); commit `prompt.md` and `measure.sh`.
@@ -120,10 +125,10 @@ to); commit `prompt.md` and `measure.sh`.
 
 ```json
 {
-  "maxIterations": 50,
-  "maxAutoResumeTurns": 100,
-  "finalReview": true,
-  "workingDir": "/path/to/project"
+	"maxIterations": 50,
+	"maxAutoResumeTurns": 100,
+	"finalReview": true,
+	"workingDir": "/path/to/project"
 }
 ```
 
@@ -134,11 +139,12 @@ to); commit `prompt.md` and `measure.sh`.
 
 ## Tools
 
-| Tool | Does |
-|---|---|
-| `init_experiment` | Binds a session to the thread. Takes `working_dir` (Amp exposes no cwd to plugins), name, metric, direction. Validates the git repo, refuses dirty worktrees, confirms takeovers and first activations. |
-| `run_experiment` | Runs `.auto/measure.sh` (only — see safety), times it, parses `METRIC` lines, runs `checks.sh`, truncates output. |
-| `log_experiment` | Appends to `log.jsonl`; `keep` → `git add -A && git commit`; anything else → revert everything except `.auto/`. Computes a MAD-based confidence score. |
+| Tool                  | Does                                                                                                                                                                                                    |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `init_experiment`     | Binds a session to the thread. Takes `working_dir` (Amp exposes no cwd to plugins), name, metric, direction. Validates the git repo, refuses dirty worktrees, confirms takeovers and first activations. |
+| `run_experiment`      | Runs `.auto/measure.sh` (only — see safety), times it, parses `METRIC` lines, runs `checks.sh`, truncates output.                                                                                       |
+| `log_experiment`      | Appends to `log.jsonl`; `keep` → `git add -A && git commit`; anything else → revert everything except `.auto/`. Computes a MAD-based confidence score.                                                  |
+| `conclude_experiment` | The sanctioned way for the agent to end a session (target met, ideas exhausted). Takes a `reason`, deactivates the session, and returns the final oracle pressure-test to run before the wrap-up.       |
 
 **Confidence** is `|best − baseline| / MAD(run metrics)` — a signal-to-noise ratio,
 not a p-value. ≥2× means the win comfortably clears the benchmark's run-to-run jitter;
@@ -165,17 +171,17 @@ not a p-value. ≥2× means the win comfortably clears the benchmark's run-to-ru
 
 ## Differences from pi-autoresearch
 
-| pi | amp-autoresearch |
-|---|---|
-| `ctx.cwd` from host | explicit `working_dir` on `init_experiment` |
-| `run_experiment` accepts arbitrary commands | always runs `.auto/measure.sh` only |
-| tools gated via `setActiveTools` | tools always registered; gate on initialized session |
-| timer-based auto-resume | native `agent.end → continue` |
-| compaction hooks + deterministic summary | state digest embedded in every resume message |
+| pi                                           | amp-autoresearch                                          |
+| -------------------------------------------- | --------------------------------------------------------- |
+| `ctx.cwd` from host                          | explicit `working_dir` on `init_experiment`               |
+| `run_experiment` accepts arbitrary commands  | always runs `.auto/measure.sh` only                       |
+| tools gated via `setActiveTools`             | tools always registered; gate on initialized session      |
+| timer-based auto-resume                      | native `agent.end → continue`                             |
+| compaction hooks + deterministic summary     | state digest embedded in every resume message             |
 | auto-activates on `.auto/log.jsonl` presence | only the recorded thread reactivates (`amp-session.json`) |
-| TUI widget + fullscreen overlay | status item + browser dashboard |
-| hook stdout → steer messages | hook stdout → tool results |
-| legacy flat `autoresearch.*` files | not supported |
+| TUI widget + fullscreen overlay              | status item + browser dashboard                           |
+| hook stdout → steer messages                 | hook stdout → tool results                                |
+| legacy flat `autoresearch.*` files           | not supported                                             |
 
 ## Development
 
