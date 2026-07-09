@@ -1,14 +1,14 @@
 ---
 name: autoresearch-finalize
-description: Finalize an amp-autoresearch session into clean, independently-mergeable review branches — one per logical change, each cut from the merge-base. Use when asked to "finalize autoresearch", "clean up the experiment branch", or "prepare autoresearch results for review".
+description: Finalize an amp-autoresearch session into clean, independently-mergeable review branches — one per logical change, each cut from the merge-base or recorded PR base. Use when asked to "finalize autoresearch", "clean up the experiment branch", or "prepare autoresearch results for review".
 ---
 
 # Finalize Autoresearch
 
 Turn a noisy autoresearch branch into clean, independent branches — one per logical
-change, each starting from the merge-base. The experiment branch is a log, not a
-reviewable history; this skill extracts the net changes into commits written for
-reviewers.
+change, each starting from the merge-base or the recorded PR base commit. The
+experiment branch is a log, not a reviewable history; this skill extracts the net
+changes into commits written for reviewers.
 
 Adapted from pi-autoresearch's finalize skill (MIT,
 https://github.com/davebcn87/pi-autoresearch).
@@ -17,19 +17,32 @@ https://github.com/davebcn87/pi-autoresearch).
 
 1. Read `.auto/log.jsonl`. Filter to **kept** experiments only.
 2. Read `.auto/prompt.md` for session context.
-3. **Check `.auto/ideas.md` for a "Final review" section** (written by the
+3. Read `.auto/config.json` when present. If it contains
+   `"purpose": "pr_optimization"` and a `baseCommit`, finalise relative to that
+   commit, not the merge-base with `main`:
+   - Expand `baseCommit` with `git rev-parse <baseCommit>` and use it as
+     `groups.json.base`.
+   - Verify it is an ancestor of the autoresearch branch:
+     `git merge-base --is-ancestor <baseCommit> HEAD`.
+   - Treat `baseBranch` as context only; branches can move, but `baseCommit` is the
+     source of truth.
+   - In the grouping proposal, call out that the output branches will be PR-relative
+     optimisation branches, starting from the recorded PR base commit.
+4. **Check `.auto/ideas.md` for a "Final review" section** (written by the
    end-of-session oracle review). If it recommends reverting or simplifying any kept
    commit, surface those verdicts in your proposal: default to excluding
    revert-recommended commits from the groups, and say so — the user decides.
-4. Expand all short commit hashes to full hashes: `git rev-parse <short_hash>`.
-5. Get the merge-base: `git merge-base HEAD main` (or the repo's default branch).
-6. For each kept commit, get the diff stat (`$BASE..<commit>` for the first,
+5. Expand all short commit hashes to full hashes: `git rev-parse <short_hash>`.
+6. Choose the base:
+   - PR optimisation session: the full `.auto/config.json` `baseCommit`.
+   - Normal session: `git merge-base HEAD main` (or the repo's default branch).
+7. For each kept commit, get the diff stat (`$BASE..<commit>` for the first,
    `<prev_kept>..<commit>` for subsequent).
-7. Group kept commits into logical changesets:
+8. Group kept commits into logical changesets:
    - **Preserve application order.** Group N comes before Group N+1.
    - **No two groups may touch the same file.** Each branch is applied to merge-base
-     independently — overlapping files would conflict. If two groups touch the same
-     file, merge them into one group.
+     (or the recorded PR base commit) independently — overlapping files would
+     conflict. If two groups touch the same file, merge them into one group.
    - **Watch for cross-file dependencies.** If group 1 adds an API and group 2 calls
      it, group 2's branch won't work in isolation. Flag it ("group 2 depends on
      group 1 — review together") or merge the groups when the dependency is tight.
@@ -39,7 +52,7 @@ https://github.com/davebcn87/pi-autoresearch).
 Present the proposed grouping to the user:
 
 ```
-Proposed branches (each from merge-base, independent):
+Proposed branches (each from merge-base, or from recorded PR base, independent):
 
 1. **Skip redundant initrd probe** (commits abc1234, def5678)
    Files: guest/minimal-initrd/agent.c
@@ -60,8 +73,8 @@ Write `/tmp/groups.json`:
 
 ```json
 {
-  "base": "<full merge-base hash>",
-  "trunk": "main",
+  "base": "<full merge-base hash, or full .auto/config.json baseCommit for PR optimisation>",
+  "trunk": "main or the recorded baseBranch for PR optimisation",
   "final_tree": "<full hash of current HEAD>",
   "goal": "short-slug",
   "groups": [
@@ -78,6 +91,9 @@ Write `/tmp/groups.json`:
 Key rules:
 
 - **`last_commit` must be a full hash.** Expand jsonl short hashes with `git rev-parse`.
+- **`base` must be a full hash and an ancestor of `final_tree`.** In PR optimisation
+  sessions, use `.auto/config.json` `baseCommit` so the generated branches contain
+  only optimisation changes on top of the original PR branch.
 - **No two groups may share a file.** The script validates this and fails if violated.
 - If the approved plan excludes a revert-recommended commit whose files a later kept
   commit also touched, the later commit's snapshot still contains the excluded change
@@ -89,7 +105,7 @@ Then run (paths relative to this skill's base directory):
 bash <skill-base-dir>/finalize.sh /tmp/groups.json
 ```
 
-The script creates one branch per group from the merge-base
+The script creates one branch per group from `groups.json.base`
 (`autoresearch/<goal>/<NN>-<slug>`), verifies the union of all groups matches the
 original branch tree, and prints a summary with branches, cleanup commands, and any
 remaining ideas from `.auto/ideas.md`.

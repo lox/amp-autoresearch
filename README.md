@@ -21,6 +21,7 @@ edit code → run_experiment → log_experiment → keep or revert → repeat
 ```sh
 git clone <this repo> && cd amp-autoresearch
 mise run install    # installs into ~/.config/amp/plugins/
+amp skill add https://github.com/lox/amp-autoresearch
 ```
 
 Restart Amp (or `plugins: reload` from the command palette), open a thread, then run
@@ -28,6 +29,12 @@ Restart Amp (or `plugins: reload` from the command palette), open a thread, then
 one-sentence goal, and the agent does the rest: creates a branch, writes the session
 playbook and benchmark script, takes a baseline, and starts looping. Fresh sessions
 open the browser dashboard automatically.
+
+Skills install separately from plugins. `amp skill add` installs both bundled skills:
+**optimising-with-autoresearch** (prompt UX for "optimise this PR") and
+**autoresearch-finalize** (turn a completed session into review branches). If you add
+skills while Amp is already running, reload/restart Amp before expecting them to be
+discovered.
 
 The installer prefers a symlink back to this checkout. On systems where file symlinks
 are unavailable (notably some Windows setups), it writes a tiny import shim instead;
@@ -87,21 +94,33 @@ AMP_AUTORESEARCH_ASSUME_YES=1 amp -x "Set up and run an autoresearch loop: <goal
 
 Raise `maxAutoResumeTurns` (below) for long unattended runs.
 
+### Launching from another Amp prompt
+
+The plugin also exposes `start_autoresearch`, an agent-callable launcher tool. Ask Amp
+to "optimise this PR with autoresearch" (or call the tool directly) and it creates a
+new deep thread by default, sends the same setup/resume prompt as `Autoresearch:
+Start`, and returns the thread link. Keeping the loop in a child thread means the
+current PR/review thread does not get consumed by hours of auto-resumes.
+
+For PR optimisation passes, call it with `purpose: "pr_optimization"`. The kickoff
+records the starting branch and commit in `.auto/config.json` so the session preserves
+the context the finalise skill needs to create optimisation branches on top of the
+existing PR.
+
 ## Finalizing a session
 
 The experiment branch is a log, not a reviewable history. The bundled
 **autoresearch-finalize** skill turns the kept experiments into independent review
-branches — one clean, reviewer-facing commit each, cut from the merge-base so they
-merge in any order. It reads the end-of-session oracle review verdicts from
-`.auto/ideas.md` and proposes a grouping for your approval before touching anything.
+branches — one clean, reviewer-facing commit each, cut from the merge-base (or, for
+PR optimisation sessions, the recorded PR base commit) so they merge in any order. It
+reads the end-of-session oracle review verdicts from `.auto/ideas.md` and proposes a
+grouping for your approval before touching anything.
 
-Skills install separately from plugins:
-
-```sh
-amp skill add https://github.com/lox/amp-autoresearch
-```
-
-Then ask the agent to "finalize the autoresearch session" on the experiment branch.
+After installing the bundled skills, ask the agent to "finalize the autoresearch
+session" on the experiment branch.
+The repo also bundles **optimising-with-autoresearch**, a thin skill that teaches Amp
+to use the launcher tool for prompts like "optimise this PR" or "make this benchmark
+faster".
 
 ## Session files (`.auto/`)
 
@@ -141,6 +160,7 @@ to); commit `prompt.md` and `measure.sh`.
 
 | Tool                  | Does                                                                                                                                                                                                    |
 | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `start_autoresearch`  | Kick off an autoresearch setup/resume prompt from an agent turn. Defaults to a new deep thread; can instead queue in the current thread or return the prompt.                                           |
 | `init_experiment`     | Binds a session to the thread. Takes `working_dir` (Amp exposes no cwd to plugins), name, metric, direction. Validates the git repo, refuses dirty worktrees, confirms takeovers and first activations. |
 | `run_experiment`      | Runs `.auto/measure.sh` (only — see safety), times it, parses `METRIC` lines, runs `checks.sh`, truncates output.                                                                                       |
 | `log_experiment`      | Appends to `log.jsonl`; `keep` → `git add -A && git commit`; anything else → revert everything except `.auto/`. Computes a MAD-based confidence score.                                                  |

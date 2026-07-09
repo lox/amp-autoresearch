@@ -11,7 +11,7 @@ set -euo pipefail
 #
 # groups.json format:
 # {
-#   "base": "<full merge-base commit hash>",
+#   "base": "<full merge-base commit hash, or .auto/config.json baseCommit for PR optimisation>",
 #   "trunk": "main",
 #   "final_tree": "<full HEAD hash of autoresearch branch>",
 #   "goal": "short-slug",
@@ -128,6 +128,11 @@ assert_commits_exist() {
   git rev-parse "$FINAL_TREE" >/dev/null 2>&1 || fail "Final tree commit $FINAL_TREE not found."
 }
 
+assert_base_ancestor() {
+  git merge-base --is-ancestor "$BASE" "$FINAL_TREE" \
+    || fail "Base commit $BASE is not an ancestor of final tree $FINAL_TREE. For PR optimisation sessions, use .auto/config.json baseCommit from the session start."
+}
+
 collect_group_files() {
   local group_index="$1" prev_commit="$2"
   local last_commit
@@ -172,6 +177,7 @@ preflight() {
 
   assert_on_feature_branch
   assert_commits_exist
+  assert_base_ancestor
 
   local prev_commit="$BASE"
   local all_seen_path="$DATA_DIR/all_seen_files"
@@ -255,8 +261,8 @@ create_group_branch() {
     return
   fi
 
-  # Start from merge-base (not the previous group) so each branch is
-  # independently mergeable — reviewers can land them in any order.
+  # Start from the chosen base (merge-base, or recorded PR base) rather than the
+  # previous group so each branch is independently mergeable.
   git checkout "$BASE" --quiet --detach 2>/dev/null || git checkout "$BASE" --quiet
   git checkout -b "$branch_name"
 
@@ -285,7 +291,7 @@ create_branches() {
     create_group_branch "$i"
   done
 
-  info "Created ${#CREATED_BRANCHES[@]} branches (all from merge-base, independent):"
+  info "Created ${#CREATED_BRANCHES[@]} branches (all from base ${BASE:0:12}, independent):"
   for branch in "${CREATED_BRANCHES[@]}"; do echo "  $branch"; done
 
   # Disarm rollback — creation succeeded. Verify failures intentionally leave

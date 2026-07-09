@@ -7,6 +7,8 @@ import {
 	bindThreadSession,
 	checkSecondaryMetrics,
 	executeRun,
+	executeStartAutoresearch,
+	gitHead,
 	gitCommitAll,
 	gitIsDirty,
 	gitRevertAll,
@@ -107,6 +109,87 @@ test('run_experiment refuses unbound/missing and parses real measure.sh', async 
 	const out = await executeRun({}, ctx)
 	expect(out).toContain('✅ PASSED')
 	expect(out).toContain('x=1')
+})
+
+test('start_autoresearch launches a new thread with PR metadata', async () => {
+	const dir = repo()
+	execFileSync('git', ['checkout', '-b', 'feature/pr'], { cwd: dir })
+	const messages: string[] = []
+	let createOptions: { show?: boolean; parentThreadID?: string } | null = null
+	const out = await executeStartAutoresearch(
+		{
+			goal: 'speed up this PR',
+			working_dir: dir,
+			max_iterations: 12,
+			purpose: 'pr_optimization',
+		},
+		ctx,
+		{
+			ampURL: new URL('https://ampcode.com'),
+			createThread: async (options) => {
+				createOptions = options
+				return {
+					id: 'T-child',
+					appendUserMessage: async (message) => {
+						messages.push(message.content)
+					},
+				}
+			},
+		},
+	)
+	expect(out).toContain('[T-child](https://ampcode.com/threads/T-child)')
+	expect(createOptions).not.toBeNull()
+	expect(createOptions!).toEqual({ show: true, parentThreadID: 'T-test' })
+	expect(messages.length).toBe(1)
+	expect(messages[0]).toContain('speed up this PR')
+	expect(messages[0]).toContain('PR optimisation context')
+	expect(messages[0]).toContain('"maxIterations": 12')
+	expect(messages[0]).toContain('"purpose": "pr_optimization"')
+	expect(messages[0]).toContain('"baseBranch": "feature/pr"')
+	expect(messages[0]).toContain((await gitHead(dir))!)
+})
+
+test('start_autoresearch can queue in the current thread or return a resume prompt', async () => {
+	const dir = repo()
+	const queued: Array<{ content: string; steer?: boolean }> = []
+	const out = await executeStartAutoresearch(
+		{ goal: 'make it faster', working_dir: dir, target: 'current_thread' },
+		{
+			...ctx,
+			thread: {
+				...ctx.thread,
+				appendUserMessage: async (message, options) => {
+					queued.push({ content: message.content, steer: options?.steer })
+				},
+			},
+		},
+	)
+	expect(out).toContain('queued in this thread')
+	expect(queued).toHaveLength(1)
+	expect(queued[0]!.steer).toBe(true)
+	expect(queued[0]!.content).toContain('make it faster')
+
+	fs.mkdirSync(path.join(dir, '.auto'), { recursive: true })
+	fs.writeFileSync(path.join(dir, '.auto', 'prompt.md'), '# existing session\n')
+	const prompt = await executeStartAutoresearch({ working_dir: dir, target: 'return_prompt' }, ctx)
+	expect(prompt).toContain('Resume the autoresearch experiment loop')
+})
+
+test('start_autoresearch refuses dirty worktrees before launching a new session', async () => {
+	const dir = repo()
+	fs.writeFileSync(path.join(dir, 'tracked.txt'), 'dirty\n')
+	let created = false
+	const out = await executeStartAutoresearch({ goal: 'make it faster', working_dir: dir }, ctx, {
+		createThread: async () => {
+			created = true
+			return {
+				id: 'T-child',
+				appendUserMessage: async () => {},
+			}
+		},
+	})
+	expect(out).toContain('Working tree is dirty')
+	expect(created).toBe(false)
 })
 
 test('log_experiment refuses invalid status and non-finite metric', async () => {

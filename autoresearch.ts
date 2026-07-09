@@ -50,6 +50,9 @@ export interface AutoConfig {
 	workingDir?: string
 	maxAutoResumeTurns?: number
 	finalReview?: boolean
+	purpose?: string
+	baseBranch?: string
+	baseCommit?: string
 }
 export interface AmpSession {
 	version: 1
@@ -639,6 +642,13 @@ export async function gitShortHead(dir: string): Promise<string | null> {
 		return null
 	}
 }
+export async function gitHead(dir: string): Promise<string | null> {
+	try {
+		return (await git(['rev-parse', 'HEAD'], dir)).stdout.trim() || null
+	} catch {
+		return null
+	}
+}
 export async function gitCommitAll(
 	dir: string,
 	message: string,
@@ -837,6 +847,32 @@ export function buildSessionSnapshot(state: SessionState): Record<string, unknow
 
 // ── Kickoff prompts (port of pi's autoresearch-create skill) ──
 
+export interface KickoffOptions {
+	maxIterations?: number
+	config?: Record<string, unknown>
+}
+
+function kickoffMaxIterations(value: unknown): number {
+	const n = Number(value)
+	return Number.isFinite(n) && n > 0 ? Math.floor(n) : 30
+}
+function buildKickoffConfig(options: KickoffOptions = {}): string {
+	return JSON.stringify(
+		{ maxIterations: kickoffMaxIterations(options.maxIterations), ...(options.config ?? {}) },
+		null,
+		'\t',
+	)
+}
+function buildKickoffContext(config: Record<string, unknown> | undefined): string {
+	if (!config || config.purpose !== 'pr_optimization') return ''
+	const branch = typeof config.baseBranch === 'string' ? config.baseBranch : 'the current branch'
+	const commit = typeof config.baseCommit === 'string' ? config.baseCommit : 'the current HEAD'
+	return `
+## PR optimisation context
+
+This autoresearch session starts from PR branch ${branch} at ${commit}. Treat existing PR changes as the base being optimised; kept experiments should be easy to bring back onto that PR branch after the session.`
+}
+
 const LOOP_RULES = `## Loop Rules
 
 **LOOP FOREVER.** Never ask "should I continue?" — the user expects autonomous work.
@@ -858,11 +894,17 @@ const LOOP_RULES = `## Loop Rules
 **NEVER STOP SILENTLY.** The user may be away for hours. Keep going until interrupted, capped, or genuinely done. If you believe the session is complete (target met and remaining ideas are marginal, or ideas exhausted), do not write a wrap-up on your own: call \`conclude_experiment\` with your reason — it returns the mandatory final pressure-test to run before your wrap-up.`
 
 /** Kickoff message for a brand-new session (no .auto/prompt.md yet). */
-export function buildCreateKickoff(goal: string, workdir: string): string {
+export function buildCreateKickoff(
+	goal: string,
+	workdir: string,
+	options: KickoffOptions = {},
+): string {
+	const config = buildKickoffConfig(options)
 	return `Set up and run an autonomous experiment loop (autoresearch).
 
 **Goal:** ${goal}
 **Working directory:** ${workdir}
+${buildKickoffContext(options.config)}
 
 ## Setup
 
@@ -873,7 +915,14 @@ export function buildCreateKickoff(goal: string, workdir: string): string {
    - \`.auto/prompt.md\` — the session playbook (objective, metrics, how to run, files in scope, off limits, constraints, "what's been tried"). A fresh agent with no context must be able to run the loop from this file alone. Invest in it.
    - \`.auto/measure.sh\` — bash, \`set -euo pipefail\`, runs the benchmark and prints \`METRIC name=value\` lines (primary metric name must match init_experiment's metric_name). For fast noisy benchmarks (<5s), run several times inside the script and report the median. **It must build the code under test itself** (or verify the benchmarked artifact is newer than the source tree) — never benchmark a stale build; a \`--no-build\` flag on the benchmark without a preceding build step silently measures the pre-edit binary.
    - Add \`.auto/log.jsonl\`, \`.auto/amp-session.json\`, and \`.auto/amp-inflight.json\` to .gitignore.
-   - Write \`.auto/config.json\` with \`{"maxIterations": 30}\` unless the user's goal implies a different budget — an unattended loop should have a ceiling the user chose, not one they forgot.
+   - Write \`.auto/config.json\` with:
+     \`\`\`json
+${config
+	.split('\n')
+	.map((line) => `     ${line}`)
+	.join('\n')}
+     \`\`\`
+     Keep any PR/base metadata in this file; unattended loops should have a ceiling the user chose, not one they forgot.
    - Only if constraints require correctness validation, write \`.auto/checks.sh\` (runs after every passing benchmark; keep output minimal — errors only).
    Commit these files.
 5. Call \`init_experiment\` with working_dir set to the workspace root (${workdir}), plus name, metric_name, metric_unit, direction. Pick a unit that puts typical values in the 1–1000 range so dashboards and deltas stay readable: measure a ~0.014s benchmark as \`wall_ms\` ≈ 14, not \`wall_seconds\` ≈ 0.014.
@@ -1137,7 +1186,28 @@ export function deactivateSession(workdir: string, opts?: { suppressFinalReview?
 
 type ToolCtx = {
 	ui?: { confirm?: (o: { title: string; message?: string }) => Promise<boolean> }
-	thread: { id: string; state?: { get?: () => Promise<string> } }
+	thread: {
+		id: string
+		state?: { get?: () => Promise<string> }
+		appendUserMessage?: (
+			message: { type: 'user-message'; content: string },
+			options?: { steer?: boolean },
+		) => Promise<void>
+	}
+}
+type StartAutoresearchTarget = 'new_thread' | 'current_thread' | 'return_prompt'
+type StartAutoresearchMode = 'auto' | 'create' | 'resume'
+type LaunchThread = {
+	id: string
+	appendUserMessage: (
+		message: { type: 'user-message'; content: string },
+		options?: { steer?: boolean },
+	) => Promise<void>
+}
+export interface StartAutoresearchDeps {
+	workspaceRoot?: string | null
+	ampURL?: URL
+	createThread?: (options: { show?: boolean; parentThreadID?: string }) => Promise<LaunchThread>
 }
 const unbound =
 	'No experiment session for this thread. Call init_experiment with the workspace root first.'
@@ -1171,6 +1241,114 @@ function readState(workdir: string): SessionState {
 	return reconstructJsonlState(
 		fs.existsSync(logPath(workdir)) ? fs.readFileSync(logPath(workdir), 'utf-8') : '',
 	)
+}
+
+function launchChoice<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
+	return typeof value === 'string' && (allowed as readonly string[]).includes(value)
+		? (value as T)
+		: fallback
+}
+function launchBoolean(value: unknown, fallback: boolean): boolean {
+	return typeof value === 'boolean' ? value : fallback
+}
+function launchPositiveInt(value: unknown): number | undefined {
+	const n = Number(value)
+	return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined
+}
+function threadReference(threadID: string, ampURL?: URL): string {
+	if (!ampURL) return threadID
+	try {
+		return `[${threadID}](${new URL(`/threads/${threadID}`, ampURL).toString()})`
+	} catch {
+		return threadID
+	}
+}
+
+export async function executeStartAutoresearch(
+	input: Record<string, unknown>,
+	ctx: ToolCtx,
+	deps: StartAutoresearchDeps = {},
+): Promise<string> {
+	try {
+		const target = launchChoice<StartAutoresearchTarget>(
+			input.target,
+			['new_thread', 'current_thread', 'return_prompt'],
+			'new_thread',
+		)
+		const mode = launchChoice<StartAutoresearchMode>(
+			input.mode,
+			['auto', 'create', 'resume'],
+			'auto',
+		)
+		const rawWorkdir =
+			typeof input.working_dir === 'string' && input.working_dir.trim()
+				? input.working_dir.trim()
+				: deps.workspaceRoot
+		if (!rawWorkdir) return '❌ working_dir is required when no Amp workspace is open.'
+		if (!path.isAbsolute(rawWorkdir)) return '❌ working_dir must be an absolute path.'
+		if (!fs.existsSync(rawWorkdir) || !fs.statSync(rawWorkdir).isDirectory())
+			return `❌ working_dir is not a directory: ${rawWorkdir}`
+		const top = await gitToplevel(fs.realpathSync(rawWorkdir))
+		if (!top) return '❌ working_dir must be inside a git repository.'
+		const workdir = fs.realpathSync(resolveWorkDir(top))
+		const goal = String(input.goal ?? '').trim()
+		const hasPrompt = fs.existsSync(promptPath(workdir))
+		if (mode === 'create' && hasPrompt)
+			return '❌ .auto/prompt.md already exists. Use mode:"auto" or mode:"resume" to resume it, or remove the stale session first.'
+		if (mode === 'resume' && !hasPrompt)
+			return '❌ Cannot resume: .auto/prompt.md does not exist yet.'
+		const resume = mode === 'resume' || (mode === 'auto' && hasPrompt)
+		if (!resume && !goal) return '❌ goal is required to start a new autoresearch session.'
+
+		const session = readSessionFile(workdir)
+		if (session?.active && session.threadID !== ctx.thread.id)
+			return `❌ Autoresearch session in ${workdir} is already held by thread ${session.threadID}. Stop it there first, or call init_experiment here to take over deliberately.`
+		if (session?.active && target === 'new_thread')
+			return `❌ This thread already owns an active autoresearch session in ${workdir}. Use target:"current_thread" to steer it, or stop it before launching a new thread.`
+		if (!resume && (await gitIsDirty(workdir)))
+			return '❌ Working tree is dirty — commit or stash first. Autoresearch auto-reverts will destroy uncommitted changes.'
+
+		let kickoff: string
+		if (resume) {
+			kickoff = buildResumeKickoff(workdir)
+		} else {
+			const maxIterations = launchPositiveInt(input.max_iterations)
+			const config: Record<string, unknown> = {}
+			if (input.purpose === 'pr_optimization') {
+				config.purpose = 'pr_optimization'
+				const branch = await gitCurrentBranch(workdir)
+				const head = await gitHead(workdir)
+				if (branch) config.baseBranch = branch
+				if (head) config.baseCommit = head
+			}
+			kickoff = buildCreateKickoff(goal, workdir, { maxIterations, config })
+		}
+
+		if (target === 'return_prompt') return kickoff
+		if (target === 'current_thread') {
+			if (!ctx.thread.appendUserMessage)
+				return `❌ Current thread cannot be appended to. Paste this to start:\n\n${kickoff}`
+			await ctx.thread.appendUserMessage(
+				{ type: 'user-message', content: kickoff },
+				{ steer: true },
+			)
+			return resume
+				? `✅ Autoresearch resume kickoff queued in this thread for ${workdir}.`
+				: `✅ Autoresearch kickoff queued in this thread for ${workdir}.`
+		}
+		if (!deps.createThread)
+			return `❌ This Amp runtime cannot create a background thread. Paste this to start:\n\n${kickoff}`
+		const thread = await deps.createThread({
+			show: launchBoolean(input.show, true),
+			parentThreadID: ctx.thread.id,
+		})
+		await thread.appendUserMessage({ type: 'user-message', content: kickoff })
+		return resume
+			? `✅ Autoresearch resume kickoff sent to ${threadReference(thread.id, deps.ampURL)} for ${workdir}.`
+			: `✅ Autoresearch kickoff sent to ${threadReference(thread.id, deps.ampURL)} for ${workdir}.`
+	} catch (e) {
+		return `❌ start_autoresearch failed: ${e instanceof Error ? e.message : String(e)}`
+	}
 }
 
 export async function executeInit(input: Record<string, unknown>, ctx: ToolCtx): Promise<string> {
@@ -1580,6 +1758,74 @@ export async function executeConclude(
 }
 
 export default function (amp: PluginAPI) {
+	const workspaceRootPath = () => {
+		const wsRoot = amp.system.workspaceRoot
+		return wsRoot ? amp.helpers.filePathFromURI(wsRoot) : null
+	}
+
+	amp.registerTool({
+		name: 'start_autoresearch',
+		description:
+			'Kick off an autoresearch session from a prompt. Creates a new deep thread by default and sends the setup/resume prompt; use for optimising PRs, making code faster, or running autonomous performance passes.',
+		inputSchema: {
+			type: 'object',
+			properties: {
+				goal: {
+					type: 'string',
+					description:
+						'One-sentence optimisation goal, e.g. "make the parser benchmark faster". Required for new sessions.',
+				},
+				working_dir: {
+					type: 'string',
+					description:
+						'Absolute path to the git repository to experiment in. Defaults to the open Amp workspace.',
+				},
+				target: {
+					type: 'string',
+					enum: ['new_thread', 'current_thread', 'return_prompt'],
+					default: 'new_thread',
+					description:
+						'Where to send the kickoff. Default: new_thread, so long autoresearch loops do not consume the current PR thread.',
+				},
+				mode: {
+					type: 'string',
+					enum: ['auto', 'create', 'resume'],
+					default: 'auto',
+					description:
+						'auto resumes when .auto/prompt.md exists, otherwise starts a new session. Default: auto.',
+				},
+				max_iterations: {
+					type: 'number',
+					minimum: 1,
+					default: 30,
+					description:
+						'Max experiment budget to write into .auto/config.json for new sessions. Default: 30.',
+				},
+				purpose: {
+					type: 'string',
+					enum: ['pr_optimization'],
+					description:
+						'Set to pr_optimization when optimising an existing PR/branch; the kickoff records the starting branch and commit.',
+				},
+				show: {
+					type: 'boolean',
+					default: true,
+					description: 'For target=new_thread, show and focus the created thread. Default: true.',
+				},
+			},
+		},
+		execute: (input, ctx) =>
+			executeStartAutoresearch(input, ctx, {
+				workspaceRoot: workspaceRootPath(),
+				ampURL: amp.system.ampURL,
+				createThread: (options) =>
+					amp.getBuiltinAgent('deep').createThread({
+						show: options.show,
+						parentThreadID: options.parentThreadID as `T-${string}` | undefined,
+					}),
+			}),
+	})
+
 	amp.registerTool({
 		name: 'init_experiment',
 		description: 'Initialize an autoresearch experiment session for this thread.',
