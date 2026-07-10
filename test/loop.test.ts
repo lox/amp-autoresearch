@@ -178,6 +178,8 @@ test('final review message lists kept commits and forbids new experiments', asyn
 	)
 	const msg = buildFinalReviewMessage(state, '/repo')
 	expect(msg).toContain('Do NOT run more experiments')
+	expect(msg).toContain('Do not call run_experiment')
+	expect(msg).toContain('Do not make code changes')
 	expect(msg).toContain('pressure-test the kept experiments with the oracle')
 	expect(msg).toContain('Correctness beyond the benchmark')
 	expect(msg).toContain('Resource scaling')

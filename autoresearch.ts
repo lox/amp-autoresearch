@@ -1110,6 +1110,9 @@ export function buildFinalReviewMessage(state: SessionState, workdir: string): s
 	)
 	return [
 		'The autoresearch session has ended. Do NOT run more experiments.',
+		'Do not call run_experiment, log_experiment, init_experiment, or start_autoresearch.',
+		'Do not make code changes in this final-review turn; record recommended fixes',
+		'as follow-up work unless the user explicitly asks you to implement them.',
 		'',
 		'Final step: pressure-test the kept experiments with the oracle. Give it the kept',
 		`commits below with their full diffs, the run log (${logPath(workdir)}), and the`,
@@ -1220,6 +1223,11 @@ const unbound =
 function ownershipError(threadID: string, workdir: string): string | null {
 	const s = readSessionFile(workdir)
 	if (s?.active && s.threadID === threadID) return null
+	if (s && !s.active && s.threadID === threadID) {
+		if (s.finalReviewSent)
+			return `❌ Autoresearch session in ${workdir} has already ended and the final review was sent. Do not rebind or start a new loop unless the user explicitly asks; use normal shell commands for any post-review validation.`
+		return `❌ Autoresearch session in ${workdir} is inactive. Ask the user before starting or rebinding a session.`
+	}
 	return `❌ This thread no longer holds the autoresearch session in ${workdir}. Call init_experiment to rebind.`
 }
 /** Coerce agent-supplied seconds to a positive finite number, else the default. */

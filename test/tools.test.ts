@@ -99,6 +99,18 @@ test('run_experiment refuses unbound/missing and parses real measure.sh', async 
 		version: 1,
 		threadID: 'T-test',
 		workdir: dir,
+		active: false,
+		autoResumeTurns: 0,
+		activatedAt: Date.now(),
+		finalReviewSent: true,
+	})
+	const ended = await executeRun({}, ctx)
+	expect(ended).toContain('already ended')
+	expect(ended).not.toContain('init_experiment')
+	writeSessionFile(dir, {
+		version: 1,
+		threadID: 'T-test',
+		workdir: dir,
 		active: true,
 		autoResumeTurns: 0,
 		activatedAt: Date.now(),
