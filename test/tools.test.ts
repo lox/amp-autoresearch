@@ -127,7 +127,11 @@ test('start_autoresearch launches a new thread with PR metadata', async () => {
 	const dir = repo()
 	execFileSync('git', ['checkout', '-b', 'feature/pr'], { cwd: dir })
 	const messages: string[] = []
-	let createOptions: { show?: boolean; parentThreadID?: string } | null = null
+	let createOptions: {
+		show?: boolean
+		parentThreadID?: string
+		executor?: 'local' | 'orb'
+	} | null = null
 	const out = await executeStartAutoresearch(
 		{
 			goal: 'speed up this PR',
@@ -159,6 +163,86 @@ test('start_autoresearch launches a new thread with PR metadata', async () => {
 	expect(messages[0]).toContain('"purpose": "pr_optimization"')
 	expect(messages[0]).toContain('"baseBranch": "feature/pr"')
 	expect(messages[0]).toContain((await gitHead(dir))!)
+})
+
+test('start_autoresearch launches an orb thread with a portable workspace path', async () => {
+	const dir = repo()
+	const messages: string[] = []
+	let createOptions: {
+		show?: boolean
+		parentThreadID?: string
+		executor?: 'local' | 'orb'
+	} | null = null
+	const out = await executeStartAutoresearch(
+		{
+			goal: 'make it faster remotely',
+			working_dir: dir,
+			executor: 'orb',
+		},
+		ctx,
+		{
+			workspaceRoot: dir,
+			ampURL: new URL('https://ampcode.com'),
+			createThread: async (options) => {
+				createOptions = options
+				return {
+					id: 'T-orb',
+					appendUserMessage: async (message) => {
+						messages.push(message.content)
+					},
+				}
+			},
+		},
+	)
+
+	expect(createOptions!).toEqual({
+		show: true,
+		parentThreadID: 'T-test',
+		executor: 'orb',
+	})
+	expect(messages).toHaveLength(1)
+	expect(messages[0]).toContain('<orb-workspace>')
+	expect(messages[0]).toContain((await gitHead(dir))!)
+	expect(messages[0]).not.toContain(dir)
+	expect(out).toContain('[T-orb](https://ampcode.com/threads/T-orb)')
+	expect(out).toContain('amp sync T-orb')
+})
+
+test('start_autoresearch refuses to resume session state in a fresh orb clone', async () => {
+	const dir = repo()
+	fs.mkdirSync(path.join(dir, '.auto'), { recursive: true })
+	fs.writeFileSync(path.join(dir, '.auto', 'prompt.md'), '# existing session\n')
+	let created = false
+	const out = await executeStartAutoresearch({ working_dir: dir, executor: 'orb' }, ctx, {
+		workspaceRoot: dir,
+		createThread: async () => {
+			created = true
+			throw new Error('should not create')
+		},
+	})
+
+	expect(created).toBe(false)
+	expect(out).toContain('fresh clone cannot resume')
+})
+
+test('start_autoresearch refuses to launch an orb for a different workspace repository', async () => {
+	const workspace = repo()
+	const other = repo()
+	let created = false
+	const out = await executeStartAutoresearch(
+		{ goal: 'make it faster remotely', working_dir: other, executor: 'orb' },
+		ctx,
+		{
+			workspaceRoot: workspace,
+			createThread: async () => {
+				created = true
+				throw new Error('should not create')
+			},
+		},
+	)
+
+	expect(created).toBe(false)
+	expect(out).toContain('open Amp workspace repository')
 })
 
 test('start_autoresearch can queue in the current thread or return a resume prompt', async () => {

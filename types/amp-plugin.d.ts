@@ -300,6 +300,15 @@ declare module '@ampcode/plugin' {
 		reasoningEffort?: AgentReasoningEffort
 	}
 
+	export type AgentThreadExecutor =
+		| 'local'
+		| 'orb'
+		| {
+				type: 'runner'
+				/** Stable ID of a live Amp runner process. */
+				id: string
+		  }
+
 	export interface RunAgentOptions {
 		/** Maximum time to wait for the agent run to finish, in milliseconds (default 10 minutes). */
 		timeoutMs?: number
@@ -308,6 +317,8 @@ declare module '@ampcode/plugin' {
 		 * When omitted, the thread is created without a parent.
 		 */
 		parentThreadID?: ThreadID
+		/** Where the thread should execute. Defaults to local. */
+		executor?: AgentThreadExecutor
 	}
 
 	export interface CreateAgentThreadOptions {
@@ -318,6 +329,8 @@ declare module '@ampcode/plugin' {
 		parentThreadID?: ThreadID
 		/** Show the created thread and make it active in the client when supported. */
 		show?: boolean
+		/** Where the thread should execute. Defaults to local. */
+		executor?: AgentThreadExecutor
 	}
 
 	/** Thread handle returned by {@link Agent.createThread}. */

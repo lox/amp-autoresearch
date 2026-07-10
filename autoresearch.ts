@@ -1200,6 +1200,7 @@ type ToolCtx = {
 }
 type StartAutoresearchTarget = 'new_thread' | 'current_thread' | 'return_prompt'
 type StartAutoresearchMode = 'auto' | 'create' | 'resume'
+type StartAutoresearchExecutor = 'local' | 'orb'
 type LaunchThread = {
 	id: string
 	appendUserMessage: (
@@ -1210,7 +1211,11 @@ type LaunchThread = {
 export interface StartAutoresearchDeps {
 	workspaceRoot?: string | null
 	ampURL?: URL
-	createThread?: (options: { show?: boolean; parentThreadID?: string }) => Promise<LaunchThread>
+	createThread?: (options: {
+		show?: boolean
+		parentThreadID?: string
+		executor?: StartAutoresearchExecutor
+	}) => Promise<LaunchThread>
 }
 const unbound =
 	'No experiment session for this thread. Call init_experiment with the workspace root first.'
@@ -1272,6 +1277,23 @@ function threadReference(threadID: string, ampURL?: URL): string {
 	}
 }
 
+const ORB_WORKDIR = '<orb-workspace>'
+function buildOrbKickoffPreamble(branch: string | null, commit: string | null): string {
+	const source = commit
+		? `${branch ? `branch ${branch} at ` : ''}commit ${commit}`
+		: branch
+			? `branch ${branch}`
+			: 'the intended source revision'
+	return `## Orb workspace
+
+This thread is running in a fresh Amp orb clone, not the caller's local checkout.
+
+1. Run \`git rev-parse --show-toplevel\` and use its absolute output everywhere \`${ORB_WORKDIR}\` appears below.
+2. Before creating the experiment branch, verify that the clone contains and has checked out ${source}. Fetch and check it out if needed. If that revision is unavailable, stop and ask the user to push it; do not optimise different code.
+
+`
+}
+
 export async function executeStartAutoresearch(
 	input: Record<string, unknown>,
 	ctx: ToolCtx,
@@ -1288,6 +1310,13 @@ export async function executeStartAutoresearch(
 			['auto', 'create', 'resume'],
 			'auto',
 		)
+		const executor = launchChoice<StartAutoresearchExecutor>(
+			input.executor,
+			['local', 'orb'],
+			'local',
+		)
+		if (executor === 'orb' && target !== 'new_thread')
+			return '❌ executor:"orb" requires target:"new_thread".'
 		const rawWorkdir =
 			typeof input.working_dir === 'string' && input.working_dir.trim()
 				? input.working_dir.trim()
@@ -1298,6 +1327,13 @@ export async function executeStartAutoresearch(
 			return `❌ working_dir is not a directory: ${rawWorkdir}`
 		const top = await gitToplevel(fs.realpathSync(rawWorkdir))
 		if (!top) return '❌ working_dir must be inside a git repository.'
+		if (executor === 'orb') {
+			if (!deps.workspaceRoot)
+				return '❌ Orb launches require an open Amp workspace repository so Amp knows which project to clone.'
+			const workspaceTop = await gitToplevel(fs.realpathSync(deps.workspaceRoot))
+			if (!workspaceTop || fs.realpathSync(workspaceTop) !== fs.realpathSync(top))
+				return '❌ For an orb launch, working_dir must be inside the open Amp workspace repository because that is the project Amp clones.'
+		}
 		const workdir = fs.realpathSync(resolveWorkDir(top))
 		const goal = String(input.goal ?? '').trim()
 		const hasPrompt = fs.existsSync(promptPath(workdir))
@@ -1307,6 +1343,8 @@ export async function executeStartAutoresearch(
 			return '❌ Cannot resume: .auto/prompt.md does not exist yet.'
 		const resume = mode === 'resume' || (mode === 'auto' && hasPrompt)
 		if (!resume && !goal) return '❌ goal is required to start a new autoresearch session.'
+		if (executor === 'orb' && resume)
+			return '❌ A fresh clone cannot resume ignored autoresearch session state. Continue in the existing orb thread, or sync/finalise that session before starting a new one.'
 
 		const session = readSessionFile(workdir)
 		if (session?.active && session.threadID !== ctx.thread.id)
@@ -1317,6 +1355,12 @@ export async function executeStartAutoresearch(
 			return '❌ Working tree is dirty — commit or stash first. Autoresearch auto-reverts will destroy uncommitted changes.'
 
 		let kickoff: string
+		let sourceBranch: string | null = null
+		let sourceCommit: string | null = null
+		if (executor === 'orb' || input.purpose === 'pr_optimization') {
+			sourceBranch = await gitCurrentBranch(workdir)
+			sourceCommit = await gitHead(workdir)
+		}
 		if (resume) {
 			kickoff = buildResumeKickoff(workdir)
 		} else {
@@ -1324,12 +1368,15 @@ export async function executeStartAutoresearch(
 			const config: Record<string, unknown> = {}
 			if (input.purpose === 'pr_optimization') {
 				config.purpose = 'pr_optimization'
-				const branch = await gitCurrentBranch(workdir)
-				const head = await gitHead(workdir)
-				if (branch) config.baseBranch = branch
-				if (head) config.baseCommit = head
+				if (sourceBranch) config.baseBranch = sourceBranch
+				if (sourceCommit) config.baseCommit = sourceCommit
 			}
-			kickoff = buildCreateKickoff(goal, workdir, { maxIterations, config })
+			kickoff = buildCreateKickoff(goal, executor === 'orb' ? ORB_WORKDIR : workdir, {
+				maxIterations,
+				config,
+			})
+			if (executor === 'orb')
+				kickoff = buildOrbKickoffPreamble(sourceBranch, sourceCommit) + kickoff
 		}
 
 		if (target === 'return_prompt') return kickoff
@@ -1349,11 +1396,15 @@ export async function executeStartAutoresearch(
 		const thread = await deps.createThread({
 			show: launchBoolean(input.show, true),
 			parentThreadID: ctx.thread.id,
+			...(executor === 'orb' ? { executor } : {}),
 		})
 		await thread.appendUserMessage({ type: 'user-message', content: kickoff })
-		return resume
+		const result = resume
 			? `✅ Autoresearch resume kickoff sent to ${threadReference(thread.id, deps.ampURL)} for ${workdir}.`
 			: `✅ Autoresearch kickoff sent to ${threadReference(thread.id, deps.ampURL)} for ${workdir}.`
+		return executor === 'orb'
+			? `${result} Run \`amp sync ${thread.id}\` when you want the orb's changes locally.`
+			: result
 	} catch (e) {
 		return `❌ start_autoresearch failed: ${e instanceof Error ? e.message : String(e)}`
 	}
@@ -1774,7 +1825,7 @@ export default function (amp: PluginAPI) {
 	amp.registerTool({
 		name: 'start_autoresearch',
 		description:
-			'Kick off an autoresearch session from a prompt. Creates a new deep thread by default and sends the setup/resume prompt; use for optimising PRs, making code faster, or running autonomous performance passes.',
+			'Kick off an autoresearch session from a prompt. Creates a new deep thread by default, locally or in an Amp orb, and sends the setup/resume prompt; use for optimising PRs, making code faster, or running autonomous performance passes.',
 		inputSchema: {
 			type: 'object',
 			properties: {
@@ -1786,7 +1837,7 @@ export default function (amp: PluginAPI) {
 				working_dir: {
 					type: 'string',
 					description:
-						'Absolute path to the git repository to experiment in. Defaults to the open Amp workspace.',
+						'Absolute path to the git repository to experiment in. Defaults to the open Amp workspace. Orb launches must use that workspace repository because it determines which project Amp clones.',
 				},
 				target: {
 					type: 'string',
@@ -1794,6 +1845,13 @@ export default function (amp: PluginAPI) {
 					default: 'new_thread',
 					description:
 						'Where to send the kickoff. Default: new_thread, so long autoresearch loops do not consume the current PR thread.',
+				},
+				executor: {
+					type: 'string',
+					enum: ['local', 'orb'],
+					default: 'local',
+					description:
+						'Where target=new_thread runs. Use orb for a fresh remote clone; local remains the default to avoid surprise orb spend. Orb launches require committed, pushed source code and cannot resume ignored session state.',
 				},
 				mode: {
 					type: 'string',
@@ -1830,6 +1888,7 @@ export default function (amp: PluginAPI) {
 					amp.getBuiltinAgent('deep').createThread({
 						show: options.show,
 						parentThreadID: options.parentThreadID as `T-${string}` | undefined,
+						executor: options.executor,
 					}),
 			}),
 	})

@@ -102,6 +102,19 @@ new deep thread by default, sends the same setup/resume prompt as `Autoresearch:
 Start`, and returns the thread link. Keeping the loop in a child thread means the
 current PR/review thread does not get consumed by hours of auto-resumes.
 
+To run the loop remotely, ask Amp to "optimise this in an orb with autoresearch", or
+pass `executor: "orb"` to `start_autoresearch`. The launcher creates the child with
+`createThread({ executor: "orb" })`, translates the local working directory to the
+fresh clone's repository root, and tells the orb to verify the source commit before it
+branches. Local remains the default because orbs are billed resources.
+
+Orb launches require the source commit to be pushed: a fresh orb clone cannot see
+local-only commits or uncommitted changes. They only start new sessions; resume an
+existing remote session in its original orb thread, where the ignored `.auto/` log and
+session files live. The target must also be the open Amp workspace repository, since
+that project determines what the orb clones. Run `amp sync <thread-id>` when you want
+the orb's changes in your local checkout.
+
 For PR optimisation passes, call it with `purpose: "pr_optimization"`. The kickoff
 records the starting branch and commit in `.auto/config.json` so the session preserves
 the context the finalise skill needs to create optimisation branches on top of the
@@ -160,7 +173,7 @@ to); commit `prompt.md` and `measure.sh`.
 
 | Tool                  | Does                                                                                                                                                                                                    |
 | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `start_autoresearch`  | Kick off an autoresearch setup/resume prompt from an agent turn. Defaults to a new deep thread; can instead queue in the current thread or return the prompt.                                           |
+| `start_autoresearch`  | Kick off an autoresearch setup/resume prompt from an agent turn. Defaults to a new local deep thread; pass `executor: "orb"` for a fresh remote clone, or queue locally in the current thread/return the prompt. |
 | `init_experiment`     | Binds a session to the thread. Takes `working_dir` (Amp exposes no cwd to plugins), name, metric, direction. Validates the git repo, refuses dirty worktrees, confirms takeovers and first activations. |
 | `run_experiment`      | Runs `.auto/measure.sh` (only — see safety), times it, parses `METRIC` lines, runs `checks.sh`, truncates output.                                                                                       |
 | `log_experiment`      | Appends to `log.jsonl`; `keep` → `git add -A && git commit`; anything else → revert everything except `.auto/`. Computes a MAD-based confidence score.                                                  |
